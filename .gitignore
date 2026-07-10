@@ -1,0 +1,21 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Data (market data - too large, local only)
+data/
+
+# Output (generated artifacts, previews, node_modules)
+output/
+
+# Agent config
+.agents/
