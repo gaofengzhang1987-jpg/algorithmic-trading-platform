@@ -10,18 +10,18 @@ FilterResult = namedtuple("FilterResult", ["passed", "buy_type", "total_score", 
 
 REGIME_WEIGHTS = {
     "一买": {
-        "BEAR": {"核心验证": 1.34, "底分型": 0.43, "MACD": 0.89, "量比": 0.98, "中枢": 0.94, "距离": 0.89},
+        "BEAR": {"核心验证": 1.34, "底部放量": 1.20, "量比": 0.98, "中枢": 0.94, "MACD": 0.89, "距离": 0.89, "底分型": 0.43},
         "BULL": {"核心验证": 1.21, "底分型": 0.89, "MACD": 0.05, "量比": 0.83, "中枢": 0.94, "距离": 1.87},
         "CHOP": {"核心验证": 0.5877719770252653, "量比": 1.9296510587242894, "MACD": 0.07211783281354563, "底分型": 2.0496247460344184, "中枢": 2.312864421353475, "距离": 1.267394016376168, "区间位置": 1.6079882498225504, "波动压缩": 0.623516358220845, "时间消化": 0.08210690435719653, "相对强度": 0.6620315182610395},
     },
     "二买": {
         "BEAR": {"核心验证": 1.68, "量比": 0.00, "MACD": 1.57, "笔数": 1.00, "底分型": 0.78},
-        "BULL": {"核心验证": 2.11, "量比": 0.16, "MACD": 1.38, "笔数": 1.28, "底分型": 1.61},
+        "BULL": {"核心验证": 1.61, "MA防守": 1.50, "底分型": 1.21, "MACD": 1.38, "笔数": 1.28, "量比": 0.16},
         "CHOP": {"MACD": 2.195911252890722, "相对强度": 1.4489448612771443, "底分型": 0.6753482684105063, "时间消化": 1.7047252251521656, "量比": 0.6628224353265435, "前低防守距离": 1.3647132593452733, "二次放量启动": 0.2066965710317077, "反弹力度": 0.0009031853141467259},
     },
     "三买": {
         "BEAR": {"核心验证": 1.12, "量比": 0.05, "MACD": 1.08, "笔数": 1.68, "底分型": 1.96},
-        "BULL": {"核心验证": 1.07, "量比": 0.26, "MACD": 1.99, "笔数": 1.45, "底分型": 0.48},
+        "BULL": {"MACD": 1.99, "笔数": 1.45, "MA排列强度": 1.30, "底分型": 1.20, "核心验证": 1.07, "量比": 0.26},
         "CHOP": {"回抽深度": 0.6479279421061658, "底分型": 2.992682422467488, "相对强度": 2.344393691634057, "时间消化": 0.5440591640792536, "中枢质量": 0.24757942843710073, "MACD": 1.1613049282390944, "ZG站稳天数": 2.270646025597969, "ATR扩张比": 2.4623588209721676, "突破量持续性": 2.881954914965383},
     },
 }
@@ -196,6 +196,16 @@ class EntryFilter:
         if buy_type == "一买":
             scores["中枢"] = self._score_pivot_dist(entry_price)
             scores["距离"] = self._score_zd_distance(entry_price)
+
+        # BULL/BEAR 专属维度
+        if self.regime == "BULL":
+            if buy_type == "二买":
+                scores["MA防守"] = self._score_ma_defense_buy2(buy_event["date"])
+            elif buy_type == "三买":
+                scores["MA排列强度"] = self._score_ma_alignment_buy3()
+        elif self.regime == "BEAR":
+            if buy_type == "一买":
+                scores["底部放量"] = self._score_bottom_volume_surge_buy1(buy_event["date"])
 
         # CHOP 专属 4 维 (三买: 回抽深度代替区间位置)
         if self.regime == "CHOP":
@@ -706,6 +716,80 @@ class EntryFilter:
         elif decline < 35: return 80
         elif decline < 50: return 40
         return 10
+
+
+    # ---- BULL/BEAR 新增维度 (2026-07-20) ----
+
+    def _score_ma_defense_buy2(self, signal_date):
+        """BULL 二买 MA 防守：入场价相对 MA20/MA60 位置。MA60 上方=趋势完好。"""
+        T0 = pd.Timestamp(signal_date)
+        daily = self.daily_df.copy()
+        daily["date"] = pd.to_datetime(daily["date"])
+        daily = daily[daily["date"] <= T0]
+        if len(daily) < 60:
+            return 0
+        ma20 = daily["close"].rolling(20).mean().iloc[-1]
+        ma60 = daily["close"].rolling(60).mean().iloc[-1]
+        price = float(daily["close"].iloc[-1])
+        if price <= 0 or ma20 <= 0 or ma60 <= 0:
+            return 0
+        if price > ma60 and ma20 > ma60:
+            return 100
+        elif price > ma60 and ma20 <= ma60:
+            return 70
+        elif price > ma60:
+            return 40
+        return 0
+
+    def _score_ma_alignment_buy3(self):
+        """BULL 三买 MA 多头排列强度：MA5>MA20>MA60 且三线斜率>0。"""
+        daily = self.daily_df.copy()
+        daily["date"] = pd.to_datetime(daily["date"])
+        if len(daily) < 60:
+            return 0
+        ma5 = daily["close"].rolling(5).mean()
+        ma20 = daily["close"].rolling(20).mean()
+        ma60 = daily["close"].rolling(60).mean()
+        v5, v20, v60 = float(ma5.iloc[-1]), float(ma20.iloc[-1]), float(ma60.iloc[-1])
+        if v5 <= 0 or v20 <= 0 or v60 <= 0:
+            return 0
+        # 斜率（5日变动）
+        s5 = (ma5.iloc[-1] - ma5.iloc[-6]) / ma5.iloc[-6] if len(ma5) >= 6 else 0
+        s20 = (ma20.iloc[-1] - ma20.iloc[-21]) / ma20.iloc[-21] if len(ma20) >= 21 else 0
+        s60 = (ma60.iloc[-1] - ma60.iloc[-61]) / ma60.iloc[-61] if len(ma60) >= 61 else 0
+        if v5 > v20 > v60 and s5 > 0 and s20 > 0 and s60 > 0:
+            return 100
+        elif v5 > v20 > v60 and s5 > 0:
+            return 70
+        elif v5 > v20 > v60:
+            return 40
+        return 0
+
+    def _score_bottom_volume_surge_buy1(self, signal_date):
+        """BEAR 一买底部放量：信号日+前2日平均量 / 前20日均量。放量=恐慌出清=真底。"""
+        T0 = pd.Timestamp(signal_date)
+        daily = self.daily_df.copy()
+        daily["date"] = pd.to_datetime(daily["date"])
+        daily = daily[daily["date"] <= T0]
+        if len(daily) < 20:
+            return 0
+        vol_col = "vol" if "vol" in daily.columns else "volume"
+        if vol_col not in daily.columns:
+            return 0
+        recent_avg = daily[vol_col].tail(3).mean()
+        ma20_vol = daily[vol_col].tail(20).mean()
+        if ma20_vol <= 0:
+            return 0
+        ratio = recent_avg / ma20_vol
+        if ratio > 2.0:
+            return 100
+        elif ratio > 1.5:
+            return 75
+        elif ratio > 1.2:
+            return 50
+        elif ratio > 1.0:
+            return 20
+        return 0
 
     def _score_volume_contraction(self, signal_date):
         """一买成交量萎缩度：下跌末期量缩=抛压耗尽。后半段量/前半段量，比值越小越好。"""
