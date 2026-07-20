@@ -27,9 +27,9 @@ REGIME_WEIGHTS = {
 }
 
 REGIME_THRESHOLDS = {
-    "一买": {"BEAR": 255, "BULL": 999, "CHOP": 869},
-    "二买": {"BEAR": 273, "BULL": 327, "CHOP": 666},
-    "三买": {"BEAR": 999, "BULL": 366, "CHOP": 1341},
+    "一买": {"BEAR": 255, "BULL": 999, "CHOP": 792},
+    "二买": {"BEAR": 273, "BULL": 327, "CHOP": 544},
+    "三买": {"BEAR": 999, "BULL": 366, "CHOP": 1000},
 }
 
 
