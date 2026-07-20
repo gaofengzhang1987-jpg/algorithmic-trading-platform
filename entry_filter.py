@@ -22,7 +22,7 @@ REGIME_WEIGHTS = {
     "三买": {
         "BEAR": {"核心验证": 1.12, "量比": 0.05, "MACD": 1.08, "笔数": 1.68, "底分型": 1.96},
         "BULL": {"核心验证": 1.07, "量比": 0.26, "MACD": 1.99, "笔数": 1.45, "底分型": 0.48},
-        "CHOP": {"中枢质量": 0.80, "突破成交量": 0.15, "相对强度": 1.25, "MACD": 0.54, "底分型": 1.67, "时间消化": 0.87, "核心验证": 0.12, "回抽深度": 2.48, "量比": 0, "波动压缩": 0.08},
+        "CHOP": {"回抽深度": 2.48, "底分型": 1.67, "相对强度": 1.25, "时间消化": 0.87, "中枢质量": 0.80, "MACD": 0.54, "ZG站稳天数": 1.20, "ATR扩张比": 0.60, "突破量持续性": 0.40},
     },
 }
 
@@ -214,10 +214,117 @@ class EntryFilter:
             elif buy_type == "三买":
                 scores["突破成交量"] = self._score_breakout_volume_buy3(buy_event["date"])
                 scores["中枢质量"] = self._score_pivot_quality_buy3()
+                scores["ZG站稳天数"] = self._score_zg_stand_days_buy3(entry_price)
+                scores["ATR扩张比"] = self._score_breakout_atr_expansion_buy3(buy_event["date"])
+                scores["突破量持续性"] = self._score_breakout_volume_persistence_buy3(buy_event["date"])
 
         return scores
 
     # ---- scoring helpers ----
+
+    def _score_zg_stand_days_buy3(self, entry_price):
+        """三买 ZG 站稳天数：股价在 ZG 上方持续多少天。越长=突破越牢。"""
+        if not self.pivots or entry_price <= 0:
+            return 0
+        up_pivots = [p for p in self.pivots if p["dir"] == "上涨"]
+        if not up_pivots:
+            return 0
+        zg = up_pivots[-1].get("zg", 0)
+        if zg <= 0:
+            return 0
+        daily = self.daily_df.copy()
+        daily["date"] = pd.to_datetime(daily["date"])
+        # Count consecutive days where close > ZG, going backward from latest
+        days = 0
+        for _, row in daily.iloc[::-1].iterrows():
+            if row["close"] > zg:
+                days += 1
+            else:
+                break
+        if days >= 10:
+            return 100
+        elif days >= 6:
+            return 80
+        elif days >= 3:
+            return 55
+        elif days >= 1:
+            return 25
+        return 10
+
+    def _score_breakout_atr_expansion_buy3(self, signal_date):
+        """三买突破段 ATR 扩张比：突破后 5 天 ATR / 中枢内 ATR。>1.2=真突破。"""
+        if self.czsc is None or not self.pivots:
+            return 0
+        up_pivots = [p for p in self.pivots if p["dir"] == "上涨"]
+        if not up_pivots:
+            return 0
+        last_up = up_pivots[-1]
+        daily = self.daily_df.copy()
+        daily["date"] = pd.to_datetime(daily["date"])
+        h, l, c = daily["high"], daily["low"], daily["close"]
+        # True Range
+        tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+        # 中枢内 ATR(14)
+        pivot_mask = (daily["date"] >= last_up["sdt"]) & (daily["date"] <= last_up["edt"])
+        pivot_atr = tr[pivot_mask].mean() if pivot_mask.sum() > 0 else 0
+        if pivot_atr <= 0:
+            return 0
+        # 突破后 ATR: 从中枢结束到 signal_date
+        T0 = pd.Timestamp(signal_date)
+        breakout_mask = (daily["date"] > last_up["edt"]) & (daily["date"] <= T0)
+        breakout_atr = tr[breakout_mask].mean() if breakout_mask.sum() > 0 else 0
+        if breakout_atr <= 0:
+            return 0
+        ratio = breakout_atr / pivot_atr
+        if ratio > 1.5:
+            return 100
+        elif ratio > 1.2:
+            return 75
+        elif ratio > 1.0:
+            return 45
+        elif ratio > 0.8:
+            return 20
+        return 10
+
+    def _score_breakout_volume_persistence_buy3(self, signal_date):
+        """三买突破量持续性：突破后 5 日平均量 / 中枢内平均量。持续放量=真突破。"""
+        if self.czsc is None or not self.pivots:
+            return 0
+        up_pivots = [p for p in self.pivots if p["dir"] == "上涨"]
+        if not up_pivots:
+            return 0
+        last_up = up_pivots[-1]
+        T0 = pd.Timestamp(signal_date)
+        daily = self.daily_df.copy()
+        daily["date"] = pd.to_datetime(daily["date"])
+        vol_col = "vol" if "vol" in daily.columns else "volume"
+        if vol_col not in daily.columns:
+            return 0
+        # 中枢内均量
+        pivot_bars = daily[(daily["date"] >= last_up["sdt"]) & (daily["date"] <= last_up["edt"])]
+        if len(pivot_bars) < 3:
+            return 0
+        pivot_avg_vol = pivot_bars[vol_col].mean()
+        if pivot_avg_vol <= 0:
+            return 0
+        # 突破后 5 日均量
+        post_bars = daily[(daily["date"] > last_up["edt"]) & (daily["date"] <= T0)].tail(5)
+        if len(post_bars) < 2:
+            return 0
+        post_avg_vol = post_bars[vol_col].mean()
+        if post_avg_vol <= 0:
+            return 0
+        ratio = post_avg_vol / pivot_avg_vol
+        if ratio > 1.5:
+            return 100
+        elif ratio > 1.2:
+            return 70
+        elif ratio > 1.0:
+            return 40
+        elif ratio > 0.8:
+            return 15
+        return 10
+
     def _score_divergence_power(self):
         if self.czsc is None: return 0
         dbs = [bi for bi in self.czsc.bi_list if bi.direction == Direction.Down]
