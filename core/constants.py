@@ -1,0 +1,26 @@
+"""回测系统共享常量 — 信号列名 / 交易参数 / 路径。"""
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data" / "daily"
+SIGNALS_DIR = BASE_DIR / "data" / "signals"
+
+COMMISSION = 0.001
+CAPITAL_PER_TRADE = 100_000
+MAX_HOLD_DAYS = 99999
+STOP_LOSS_PCT = -0.08
+
+DISCOUNT_BUY1 = 0.96
+DISCOUNT_BUY2 = 0.92
+DISCOUNT_BUY3 = 0.95
+
+HALF_CUT_TIMEOUT = 30
+
+BUY1_COL = "日线_D1B_BUY1"
+BS2_COL  = "日线_D1#SMA#21_BS2辅助V230320"
+BS3_COL  = "日线_D1#SMA#34_BS3辅助V230318"
+SANMAI_COL = "日线_D1_三买辅助V230228"
+SANMAI2_COL = "日线_D1#SMA#34_BS3辅助V230319"
+SELL1_COL  = "日线_D1B_SELL1"
+BUY_COLS = [BUY1_COL, BS2_COL, BS3_COL, SANMAI_COL, SANMAI2_COL]
+SELL_COLS = [SELL1_COL, BS2_COL, BS3_COL]
