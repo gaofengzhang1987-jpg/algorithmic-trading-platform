@@ -5,11 +5,11 @@ import json, logging, os, re, time
 from pathlib import Path
 import numpy as np, pandas as pd
 
-from backtest import (
-    load_daily, _parse_signal, _detect_all_changes,
-    get_next_trading_day, get_price_at_date, compute_metrics,
-    SIGNALS_DIR, COMMISSION, CAPITAL_PER_TRADE, MAX_HOLD_DAYS, STOP_LOSS_PCT,
-)
+from core.data import load_daily, get_next_trading_day, get_price_at_date
+from core.signal_parser import parse_signal
+from core.signal_detector import detect_all_changes
+from core.metrics import compute_metrics
+from core.constants import SIGNALS_DIR, COMMISSION, CAPITAL_PER_TRADE, MAX_HOLD_DAYS, STOP_LOSS_PCT
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("phase2")
@@ -26,7 +26,7 @@ MC="日线_D1MACD12#26#9_BS1辅助V230313"; M5="日线_D1SMA#5_分类V221101"; M
 def _get_stroke(code, sig_df, buy):
     vals = [str(sig_df.iloc[buy["idx"]][c]) if c in sig_df.columns else "" for c in [B1,S1,S2]]
     for v in vals:
-        p = _parse_signal(v)
+        p = parse_signal(v)
         if ("一买" in p["v1"] or "三买" in p["v1"]) and (m := re.search(r'(\d+)', p["v2"])):
             if int(m.group(1)) >= 9: return True
     return False
@@ -43,16 +43,16 @@ def _get_volume(code, sig_df, buy):
 def _get_macd(code, sig_df, buy):
     if MC not in sig_df.columns: return False
     for i in range(min(5, len(sig_df))):
-        if "金叉" in _parse_signal(str(sig_df.iloc[-(i+1)][MC]))["v2"]: return True
+        if "金叉" in parse_signal(str(sig_df.iloc[-(i+1)][MC]))["v2"]: return True
     return False
 
 
 def _get_ma(code, sig_df, buy):
     u5 = u20 = False
     if M5 in sig_df.columns:
-        p = _parse_signal(str(sig_df[M5].iloc[-1])); u5 = "多头" in p["v1"] and "向上" in p["v2"]
+        p = parse_signal(str(sig_df[M5].iloc[-1])); u5 = "多头" in p["v1"] and "向上" in p["v2"]
     if M20 in sig_df.columns:
-        p = _parse_signal(str(sig_df[M20].iloc[-1])); u20 = "多头" in p["v1"] and "向上" in p["v2"]
+        p = parse_signal(str(sig_df[M20].iloc[-1])); u20 = "多头" in p["v1"] and "向上" in p["v2"]
     return u5 and u20
 
 
@@ -87,7 +87,7 @@ def simulate_filtered(code, rule_fn=None):
     sp = SIGNALS_DIR / f"{code}.parquet"
     if not sp.exists(): return []
     sig_df = pd.read_parquet(sp)
-    changes = _detect_all_changes(sig_df)
+    changes = detect_all_changes(sig_df)
     if not changes: return []
     buys = [c for c in changes if c["type"]=="buy"]; sells = [c for c in changes if c["type"]=="sell"]
     if not buys: return []
