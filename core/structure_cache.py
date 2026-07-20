@@ -29,3 +29,13 @@ def lookup_structure(code, target_date_str):
     bi_low = float(bi["bi_low"].iloc[-1]) if len(bi) > 0 else 0
     gg_high = float(gg["gg_high"].iloc[-1]) if len(gg) > 0 else 0
     return bi_low, gg_high
+
+
+def load_structure_for_code(code: str):
+    """加载单只股票的结构缓存（含 direction/high/low/sdt/edt/pivot_dir 等详细列）。
+    从 data/struct_cache/{code}.parquet 读取；不存在则返回 None。
+    """
+    p = BASE_DIR / "data" / "struct_cache" / f"{code}.parquet"
+    if p.exists():
+        return pd.read_parquet(p)
+    return None
