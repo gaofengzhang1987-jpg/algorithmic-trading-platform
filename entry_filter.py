@@ -17,7 +17,7 @@ REGIME_WEIGHTS = {
     "二买": {
         "BEAR": {"核心验证": 1.68, "量比": 0.00, "MACD": 1.57, "笔数": 1.00, "底分型": 0.78},
         "BULL": {"核心验证": 2.11, "量比": 0.16, "MACD": 1.38, "笔数": 1.28, "底分型": 1.61},
-        "CHOP": {"反弹力度": 0, "相对强度": 2.72, "MACD": 2.95, "底分型": 1.90, "量比": 0.88, "波动压缩": 0, "时间消化": 0.89, "区间位置": 0, "核心验证": 0.13},
+        "CHOP": {"MACD": 2.95, "相对强度": 2.72, "底分型": 1.90, "时间消化": 0.89, "量比": 0.88, "前低防守距离": 0.80, "二次放量启动": 0.60, "反弹力度": 0.40},
     },
     "三买": {
         "BEAR": {"核心验证": 1.12, "量比": 0.05, "MACD": 1.08, "笔数": 1.68, "底分型": 1.96},
@@ -211,6 +211,8 @@ class EntryFilter:
                 scores["成交量萎缩"] = self._score_volume_contraction(buy_event["date"])
             elif buy_type == "二买":
                 scores["反弹力度"] = self._score_rebound_strength_buy2(buy_event["date"])
+                scores["前低防守距离"] = self._score_prev_low_defense_buy2(buy_event["date"])
+                scores["二次放量启动"] = self._score_second_volume_breakout_buy2(buy_event["date"])
             elif buy_type == "三买":
                 scores["突破成交量"] = self._score_breakout_volume_buy3(buy_event["date"])
                 scores["中枢质量"] = self._score_pivot_quality_buy3()
@@ -323,6 +325,87 @@ class EntryFilter:
             return 40
         elif ratio > 0.8:
             return 15
+        return 10
+
+
+    def _score_prev_low_defense_buy2(self, signal_date):
+        """二买前低防守距离：(入场价-一买低点)/一买低点。>0=回踩未破前低=二买有效。"""
+        if self.czsc is None or len(self.czsc.bi_list) < 4:
+            return 0
+        bis = self.czsc.bi_list
+        T0 = pd.Timestamp(signal_date)
+        prev = [bi for bi in bis if bi.sdt <= T0]
+        if len(prev) < 3:
+            return 0
+        # 核心验证的笔结构是: Down0(一买) -> Up1(反弹) -> Down2(回踩,当前)
+        # 前低是一买的低点 = Down0.low
+        last_down_bis = [bi for bi in prev if bi.direction == Direction.Down]
+        if len(last_down_bis) < 2:
+            return 0
+        one_buy_low = float(last_down_bis[-2].low)  # 倒数第二个向下笔 = 一买低点
+        if one_buy_low <= 0:
+            return 0
+        # 当前入场价
+        T0_ts = pd.Timestamp(signal_date)
+        daily = self.daily_df.copy()
+        daily["date"] = pd.to_datetime(daily["date"])
+        row = daily[daily["date"] <= T0_ts]
+        if len(row) == 0:
+            return 0
+        entry_price = float(row["close"].iloc[-1])
+        if entry_price <= 0:
+            return 0
+        dist_pct = (entry_price - one_buy_low) / one_buy_low * 100
+        if dist_pct > 8:
+            return 100
+        elif dist_pct > 5:
+            return 85
+        elif dist_pct > 3:
+            return 65
+        elif dist_pct > 1:
+            return 40
+        elif dist_pct > 0:
+            return 15
+        return 0
+
+    def _score_second_volume_breakout_buy2(self, signal_date):
+        """二买二次放量启动：信号日量 / 回踩期均量。>1.5=放量确认反弹启动。"""
+        if self.czsc is None or len(self.czsc.bi_list) < 3:
+            return 0
+        bis = self.czsc.bi_list
+        T0 = pd.Timestamp(signal_date)
+        prev = [bi for bi in bis if bi.sdt <= T0]
+        if len(prev) < 3:
+            return 0
+        last3 = prev[-3:]
+        if last3[0].direction != Direction.Down:
+            return 0
+        if last3[1].direction != Direction.Up:
+            return 0
+        H1_date = last3[1].sdt  # 反弹笔起点 — 回踩期从此开始
+        daily = self.daily_df.copy()
+        daily["date"] = pd.to_datetime(daily["date"])
+        vol_col = "vol" if "vol" in daily.columns else "volume"
+        if vol_col not in daily.columns:
+            return 0
+        # 回踩期均量
+        retrace = daily[(daily["date"] >= H1_date) & (daily["date"] <= T0)]
+        if len(retrace) < 3:
+            return 0
+        retrace_avg = retrace[vol_col].mean()
+        if retrace_avg <= 0:
+            return 0
+        # 信号日（或最后一日）量 — 测量回踩结束时的量能启动
+        signal_vol = float(daily[daily["date"] <= T0][vol_col].iloc[-1])
+        ratio = signal_vol / retrace_avg
+        if ratio > 2.0:
+            return 100
+        elif ratio > 1.5:
+            return 75
+        elif ratio > 1.2:
+            return 45
+        elif ratio > 1.0:
+            return 20
         return 10
 
     def _score_divergence_power(self):
