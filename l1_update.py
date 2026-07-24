@@ -429,7 +429,7 @@ def refresh_rps(dry_run=False):
     if ret.returncode != 0:
         logger.warning("RPS 刷新返回码 %d: %s", ret.returncode, ret.stderr[:200])
     else:
-        for line in ret.stdout.strip().split(chr(92)+chr(110)):
+        for line in ret.stdout.strip().split('\n'):
             logger.info("  %s", line)
 # ================================================================
 #  主入口
