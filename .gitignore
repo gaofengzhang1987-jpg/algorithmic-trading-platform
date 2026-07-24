@@ -19,3 +19,14 @@ output/
 
 # Agent config
 .agents/
+# Node.js artifacts (CodeGraph CLI local install)
+node_modules/
+
+# Temporary output files (batch processing artifacts)
+tmp_out/
+
+# CodeGraph index
+.codegraph/
+
+# Draft temp files
+*.tmp

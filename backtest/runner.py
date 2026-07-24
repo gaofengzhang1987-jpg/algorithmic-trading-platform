@@ -15,7 +15,7 @@ from core.data import load_daily, load_signals, get_next_trading_day, get_price_
 from core.signal_detector import detect_all_changes
 from core.structure_cache import load_structure_cache, load_structure_for_code
 from core.metrics import compute_metrics
-from backtest.exit_engine import ExitEngine
+from backtest.exit_engine import ExitEngine, BarResult
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("backtest")
@@ -66,11 +66,6 @@ def simulate_trades(
                     sell_exit_label = sell["signal_label"]
                 break
 
-        state = "FULL"
-        half_cut_fx_high = 0
-        half_cut_day_count = 0
-        position_pct = 1.0
-
         exit_date = None
         exit_price = None
         exit_reason = ""
@@ -93,72 +88,20 @@ def simulate_trades(
             bar_close = bar["close"]
             bar_high = bar["high"]
 
-            fx_on_bar = None
-            if struct_df is not None and not struct_df.empty:
-                bar_d = bar_date.date() if hasattr(bar_date, 'date') else bar_date
-                if isinstance(bar_d, pd.Timestamp):
-                    bar_d = bar_d.date()
-                fx_rows = struct_df[
-                    (pd.to_datetime(struct_df["edt"]).dt.date == bar_d) &
-                    (struct_df["fx_b_mark"].str.contains("\u5206\u578b", na=False))
-                ]
-                if len(fx_rows) > 0:
-                    frow = fx_rows.iloc[-1]
-                    fx_on_bar = {
-                        "mark": str(frow["fx_b_mark"]),
-                        "high": float(frow.get("fx_b_high", frow.get("high", 0))),
-                        "low": float(frow.get("fx_b_low", frow.get("low", 0))),
-                    }
+            result = engine.process_bar(bar_date, bar_close, bar_high, sell_exit_target)
 
-            if state != "EMPTY":
-                engine.update_defense(bar_date)
-
-            if state != "EMPTY" and engine.defense > 0 and bar_close <= engine.defense:
-                earliest_exit = (bi, "\u7ed3\u6784\u6b62\u635f", bar_close, position_pct)
+            if result.exit:
+                exit_price = bar_close
+                if result.exit_reason == "卖点":
+                    exit_price = get_price_at_date(bar_date, daily_sorted) or bar_close
+                weighted_ret = engine.compute_weighted_return(entry_price, exit_price)
+                earliest_exit = (bi, result.exit_reason, exit_price, weighted_ret)
                 break
 
-            if state != "EMPTY" and engine.check_v_drop(bar_date, bar_close):
-                earliest_exit = (bi, "V\u578b\u66b4\u8dcc\u7a7fGG", bar_close, position_pct)
-                break
-
-            if state == "FULL":
-                half_cut = engine.check_half_cut(bar_date, bar_high, fx_on_bar)
-                if half_cut:
-                    half_cut_fx_high = half_cut["fx_high"]
-                    half_cut_day_count = 0
-                    position_pct = 0.5
-                    state = "HALF"
-
-            elif state == "HALF":
-                half_cut_day_count += 1
-
-                if engine.check_buyback(bar_date, bar_high, half_cut_fx_high):
-                    position_pct = 1.0
-                    state = "FULL"
-                    engine.rebind_defense(bar_date)
-                    half_cut_day_count = 0
-                    continue
-
-                if half_cut_day_count > 1:
-                    start_i = max(0, bi - half_cut_day_count + 1)
-                    max_high_since = window["high"].iloc[start_i : bi + 1].max()
-                    if max_high_since < half_cut_fx_high:
-                        second_sell = engine.check_second_sell(bar_date, bar_high, half_cut_fx_high, fx_on_bar)
-                        if second_sell:
-                            earliest_exit = (bi, "\u4e8c\u5356\u786e\u8ba4", bar_close, position_pct)
-                            break
-
-                if half_cut_day_count >= HALF_CUT_TIMEOUT:
-                    earliest_exit = (bi, "\u534a\u4ed3\u8d85\u65f6", bar_close, position_pct)
-                    break
-
-            if sell_exit_target is not None and bar_date >= sell_exit_target:
-                sp = get_price_at_date(bar_date, daily_sorted) or bar_close
-                earliest_exit = (bi, "\u5356\u70b9", sp, position_pct)
                 break
 
         if earliest_exit is not None:
-            exit_idx, exit_reason, exit_price_val, _ = earliest_exit
+            exit_idx, exit_reason, exit_price_val, weighted_ret = earliest_exit
             exit_date = window.iloc[exit_idx]["date"]
             exit_price = exit_price_val
             exit_reason = exit_reason
@@ -172,8 +115,7 @@ def simulate_trades(
         if exit_price is None or exit_price <= 0:
             continue
 
-        gross_return = (exit_price - entry_price) / entry_price
-        net_return = gross_return - 2 * COMMISSION
+        net_return = weighted_ret - 2 * COMMISSION
         hold_days = (exit_date - entry_date).days
 
         trades.append({

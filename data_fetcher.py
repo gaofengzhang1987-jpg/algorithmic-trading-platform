@@ -103,7 +103,26 @@ def save_cache(code: str, df: pd.DataFrame):
     df.to_parquet(p, index=False)
 
 
-def is_stale(code: str) -> bool:
+ def save_daily_close(results: dict[str, pd.DataFrame]):
+     """从内存拉取结果直接同步 daily_close.parquet，不额外读盘。"""
+     daily_close_path = DATA_DIR.parent / "daily_close.parquet"
+     rows = []
+     for code, df in results.items():
+         rows.append(df[['date', 'code', 'close']])
+     if not rows:
+         return
+     new_data = pd.concat(rows, ignore_index=True)
+     if daily_close_path.exists():
+         old = pd.read_parquet(daily_close_path)
+         merged = pd.concat([old, new_data])
+         merged = merged.drop_duplicates(subset=['date', 'code'], keep='last')
+     else:
+         merged = new_data
+     merged.sort_values(['date', 'code']).to_parquet(daily_close_path, index=False)
+     logger.info("daily_close.parquet 已同步（%d 行）", len(merged))
+ 
+ 
+ def is_stale(code: str) -> bool:
     """判断缓存是否过期（最新日 < 昨天 或 不足 LOOKBACK_DAYS 天）。"""
     df = load_cached(code)
     if df is None:
@@ -193,7 +212,10 @@ def main():
 
     results = fetch_all(codes, force=force)
 
-    elapsed = time.time() - t0
+     # 同步合并的收盘价文件（供 RPS 计算脚本使用）
+     save_daily_close(results)
+ 
+     elapsed = time.time() - t0
     logger.info("=== 完成 === 耗时 %.1f 秒, 覆盖 %d/%d 只股票", elapsed, len(results), len(codes))
 
     # 输出摘要

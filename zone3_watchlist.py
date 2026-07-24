@@ -199,6 +199,8 @@ class StrategyTwo:
             l2_volume = row.get("L2_量比得分",0)
             l2_macd   = row.get("L2_MACD得分",0)
             l2_bc     = row.get("L2_背驰得分",0)
+            l2_fractal = row.get("L2_底分型得分",0)
+            l2_zs      = row.get("L2_中枢得分",0)
 
             results.append({
                 "代码":code,"现价":row["现价"],"最新日期":row.get("最新日期",""),
@@ -208,6 +210,8 @@ class StrategyTwo:
                 "L2_MACD得分":l2_macd,"L2_背驰得分":l2_bc,
                 "L3_共振类型":s_resonance,"L3_日线双买点":s_dual,
                 "L3_30min二买":s_m30,"L3_周线止跌":s_stability,
+                "L2_底分型得分":l2_fractal,
+                "L2_中枢得分":l2_zs,
                 "L3_换手率":s_turnover,
             }); passed += 1
 

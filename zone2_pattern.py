@@ -91,14 +91,17 @@ def _score_divergence(code, cp):
     global _czsc_cache
     if code in _czsc_cache: c=_czsc_cache[code]
     else:
-        dp=DAILY/f"{code}.parquet"
-        if not dp.exists(): return 0,0,0,0
-        df=pd.read_parquet(dp)
-        if len(df)<30: return 0,0,0,0
-        bars=[RawBar(symbol=code,id=j+1,dt=r["date"].to_pydatetime(),freq=Freq.D,
-                open=r["open"],close=r["close"],high=r["high"],low=r["low"],
-                vol=r["volume"],amount=r["amount"]) for j,(_,r) in enumerate(df.iterrows())]
-        c=CZSC(bars); _czsc_cache[code]=c
+        try:
+            dp=DAILY/f"{code}.parquet"
+            if not dp.exists(): return 0,0,0,0
+            df=pd.read_parquet(dp)
+            if len(df)<30: return 0,0,0,0
+            bars=[RawBar(symbol=code,id=j+1,dt=r["date"].to_pydatetime(),freq=Freq.D,
+                    open=r["open"],close=r["close"],high=r["high"],low=r["low"],
+                    vol=r["volume"],amount=r["amount"]) for j,(_,r) in enumerate(df.iterrows())]
+            c=CZSC(bars); _czsc_cache[code]=c
+        except Exception:
+            return 0, 0, 0, 0
 
     # L2-12
     dbs=[bi for bi in c.bi_list if bi.direction==Direction.Down]
@@ -278,11 +281,16 @@ class StrategyOne:
             ld=max(dates)
             if (self.today-ld).days>FRESHNESS_DAYS: rej03+=1; continue
 
-            # P1
+            # P1: progress
+            if passed % 50 == 0 and passed > 0:
+                logger.info("  进度: %d/%d processed (L2-02 skip:%d L2-03 skip:%d)", passed, len(df), rej02, rej03)
             s_stroke=_score_stroke(b1v,s1v+s2v)
             s_volume=_score_volume(sd)
             s_macd=_score_macd(sd)
-            s_div,s_div_cnt,s_fractal,s_zs=_score_divergence(code,float(row["现价"]))
+            try:
+                s_div,s_div_cnt,s_fractal,s_zs=_score_divergence(code,float(row["现价"]))
+            except Exception:
+                s_div,s_div_cnt,s_fractal,s_zs=0,0,0,0
 
             atypes=[]
             if hy: atypes.append("一买")
@@ -311,6 +319,7 @@ def run(input_df=None):
         p=ZONES/"L1_deposition.parquet"
         if not p.exists(): logger.warning("L1 不存在"); return pd.DataFrame()
         input_df=pd.read_parquet(p)
+    global _czsc_cache; _czsc_cache={}
     if input_df.empty: return pd.DataFrame()
     s=StrategyOne(); r=s.apply(input_df)
     r.to_parquet(ZONES/"L2_pattern.parquet")

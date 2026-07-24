@@ -1,0 +1,148 @@
+ 
+## 大模型自动化开发与回测智能体规范（2026-07-20 新增）
+
+### 🛑 一、行为边界与硬熔断 (FinOps & Boundaries)
+
+**1. 额度与流量控制**
+- **硬限额（Hard Limit）：** Agent 持有的 API Key 必须在服务商后台配置日/月最大消费硬上限，严禁使用无额度限制的 Master Key。
+- **并发限速（RPM Restriction）：** 自动化优化脚本循环体中调用 LLM 时，必须硬编码 `time.sleep(3)`（单次调用间隔 ≥ 3 秒），脚本级最大 RPM ≤ 20。
+
+**2. 死循环拦截 (Max Retries Break)**
+- **重试阈值：** Agent 针对同一逻辑错误的连续自动修复尝试不得超过 **3 次**。
+- **强制退出：** `retry_count >= 3` 且仍未通过时，必须执行 `sys.exit(1)` 强行中断，保留现场并向开发者发出警报。
+
+### 🔄 二、架构与流程约束 (Architectural Constraints)
+
+采用**回测（本地计算）与生成（LLM 调用）解耦**的异步架构，消除 Token 放大效应：
+
+| 阶段 | 行为 | Token 消耗 |
+|------|------|-----------|
+| **1. 本地离线回测** | Agent 启动本地回测框架运行测试集，属于 CPU/GPU 密集型任务 | 必须为 0 |
+| **2. 错误与日志收集** | 自动收集失败 Case、指标数据及崩溃日志，汇总为本地 `error_manifest.json` | 必须为 0 |
+| **3. 批处理优化投递** | 将错误清单打包，**单次**投递给 LLM 请求优化方案 | 单次 Batch 调用 |
+
+严禁在回测循环的迭代内部高频嵌套调用 API。
+## 进程管理规则（2026-07-15 新增）
+
+**暂停/续跑原则**：任何长时间运行脚本（标注、打分、Optuna）暂停后恢复时，必须先杀掉旧进程，再启动新进程。
+
+```
+❌ 错误：VM 里新旧两个 python3 同时写同一个 parquet → 数据竞争 + CPU 争抢
+✅ 正确：ssh VM "killall -9 python3" → 确认已杀 → python3 resume.py
+```
+
+**操作流程**：
+1. `killall -9 python3` 杀旧进程
+2. `ps aux | grep python3` 确认清理完毕
+3. 启动续跑脚本
+4. 定期验证输出文件 mtime 和数据量是否增长
+
+## CZSC 运行环境规则（2026-07-17 新增）
+
+**优先级**：本地 macOS > colima VM/Linux。
+
+- CZSC 在 Intel Mac 上已验证稳定（100 只/0 崩溃，220ms/只）
+- 所有 CZSC 相关脚本（打分、struct_df 预计算、信号生成）默认在 macOS 本地跑
+- **仅在 macOS 上出现 segfault 或崩溃时**，先报告用户确认，再切换到 colima VM 执行
+- 禁止未经确认自行切到 VM
+
+
+
+---
+
+## 设计文件约束（2026-07-24 新增）
+
+以下 4 份设计文件定义管道的决策逻辑，代码变更必须同步更新对应文件：
+
+| 文件 | 对应代码 |
+|------|----------|
+| `docs/L1买点标签规则.md` | `verify_buy_type.py`, `zone1_deposition.py` |
+| `docs/L2 Regime路由规则.md` | `entry_filter.py`, `zone2_regime.py` |
+| `docs/L3 质量过滤规则.md` | `l3_filter.py`, `zone3_regime.py` |
+| `docs/L4 排名规则.md` | `l4_ranker.py`, `zone4_regime.py` |
+
+### 同步规则
+
+1. **修改阈值/权重/条件** → 必须同步更新设计文件中的对应数字和逻辑描述
+2. **新增维度/标签** → 设计文件加新行 + 注释生效日期
+3. **删除维度/标签** → 设计文件中标注 `[已废弃 YYYY-MM-DD]`，不删除行
+4. **每次管道代码修改完成后** → 检查设计文件是否需要更新
+
+
+## 线程上下文管理规则（2026-07-20 新增）
+
+**Thread hygiene**：当单线程累计消耗超过 ~500K tokens 时（逐级递增的趋势说明上下文已饱和），在响应末尾提示当前线程已接近长上下文边界，建议存档后开新线程，避免进入单次调用数百万 tokens 的指数增长区。
+
+---
+
+## 大规模脚本运行规范（2026-07-23 新增）
+
+> 2026-07-22 EntryFilter 标定 + ExitEngine 回测踩坑记录。单次会话消耗超 500K tokens，70% 浪费在 PTY 输出轮询、内联代码重发、macOS spawn 排查。
+
+### 一、输出规范
+
+**原则：不依赖 PTY stdout 捕获进度。**
+
+- 所有长运行脚本（>30s）必须写进度到文件（`open(path, "w") + f.write(msg)`）
+- Agent 通过读文件获取进度，禁止反复 `write_stdin` 轮询
+- 终输出写入 `.parquet` 或 `.json`，不通过 stdout 传数据
+
+```
+✅ python3 script.py → agent 读 progress.txt + output.parquet
+❌ python3 -u script.py → agent 反复 write_stdin 等 flush
+```
+
+### 二、脚本载体规范
+
+**原则：只用文件，不用内联代码。**
+
+- 禁止 `python3 -c "大段内联代码..."`（token 浪费 + shell 转义 bug）
+- 所有 ≥5 行的代码写入独立 `.py` 文件再执行
+- 修改后直接 `apply_patch` 改文件，不重发整个命令
+
+```
+✅ cat > tmp_out/script.py << 'PYEOF'\n...\nPYEOF\npython3 tmp_out/script.py
+❌ python3 -c "import sys; ...; sys.exit(0)"
+```
+
+### 三、macOS 并行规范
+
+**原则：macOS 上不用 `multiprocessing.Pool`。**
+
+- macOS 默认 `spawn` 模式，子进程不继承父进程 import，导致静默失败
+- 需并行时用 `nohup python3 script.py &` 独立 Python 进程，互不干扰
+- 优先单线程 + 进度写盘（2-4 小时内可接受的首选方案）
+
+```
+✅ nohup python3 script.py --chunk 0/8 & （8 个独立进程）
+✅ python3 script.py（单线程，进度写文件）
+❌ Pool(8) on macOS（spawn + czsc import fail → 全部静默返回）
+```
+
+### 四、样本验证规范
+
+**原则：任何大规模脚本（>1000 个文件/任务）必须先跑全量数据的 5% 样本。**
+
+- 样本验证通过后再全量运行
+- 验证项至少包括：产出文件数量、数据字段正确性、耗时/只 估算
+- 全量启动前向用户确认
+
+```
+✅ validate: 5745 × 5% = 287 stocks × 2.3s = 11min → 确认产出正确 → 启动全量
+❌ 5745 stocks 直接跑 → 跑完发现全部失败 → 重跑消耗 token
+```
+
+### 五、幂等与续跑
+
+**原则：所有数据构建脚本必须支持续跑。**
+
+- 输出文件存在即跳过（`if out_path.exists(): continue`）
+- 删除旧输出必须显式确认（不自动 `rm -rf`）
+- 中断后用同一命令续跑，不丢数据
+
+```
+✅ for f in files:
+       if out_path.exists(): continue  # 续跑
+       process(f)
+❌ rm -rf output_dir && process_all()  # 中断后从头跑
+```

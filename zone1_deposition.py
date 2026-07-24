@@ -12,6 +12,7 @@ import logging
 from pathlib import Path
 
 import pandas as pd
+from verify_buy_type import get_buy_label
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("zone1")
@@ -43,7 +44,7 @@ def _extract_zones(states: dict, signal_cols: list[str]) -> list[str]:
     buy_cols = [c for c in signal_cols if _is_buy_column(c)]
     for col in buy_cols:
         val = states.get(col, "")
-        if not val or "0" in str(val):
+        if not val or str(val) == "0":
             continue
         if "一买" in val:
             zones.add("一买")
@@ -93,7 +94,7 @@ def run(lookback: int = 20) -> pd.DataFrame:
                 for i in range(1, len(values)):
                     old_v = values[i - 1]
                     new_v = values[i]
-                    if old_v != new_v and "0" not in new_v and new_v != "nan":
+                    if old_v != new_v and new_v != "0" and new_v != "nan":
                         if "一买" in new_v or "二买" in new_v or "三买" in new_v:
                             buy_changes.append({
                                 "col": col,
@@ -102,33 +103,34 @@ def run(lookback: int = 20) -> pd.DataFrame:
                                 "date": str(recent.iloc[i]["dt"].date()),
                             })
 
-        if not buy_changes and not last_state_buy:
+        if not buy_changes:  # 入口②已关闭，仅通过 20 日内状态变化进入 L1
             continue
 
-        if last_state_buy and not buy_changes:
-            buy_changes.append({
-                "col": "当前持有",
-                "from": "一买/二买/三买",
-                "to": "持有中",
-                "date": last_date,
-            })
 
         latest_states = {c: str(df.iloc[-1][c]) if not pd.isna(df.iloc[-1][c]) else "" for c in signal_cols}
         zones = _extract_zones(latest_states, signal_cols)
+        if not zones:
+            continue  # 买点信号出现后又消失，最新 bar 无买点
 
         state_summary = {}
         for ch in buy_changes:
             key = ch["col"].split("_")[2] if "_" in ch["col"] else ch["col"][:20]
             state_summary[key] = f"{ch['to']}({ch['date']})"
 
-        rows.append({
-            "代码": code,
-            "现价": round(last_price, 2),
-            "最新日期": last_date,
-            "买点类型": " | ".join(zones),
-            "状态详情": " | ".join(f"{k}:{v}" for k, v in list(state_summary.items())[:5]),
-            "信号数": len(buy_changes),
-        })
+        # 按买点类型拆行，每行打细分标签
+        for bt in zones:
+            try:
+                label = get_buy_label(code, buy_type=bt)
+            except Exception:
+                label = bt  # fallback if struct_cache missing
+            rows.append({
+                "代码": code,
+                "现价": round(last_price, 2),
+                "最新日期": last_date,
+                "买点类型": label,
+                "状态详情": " | ".join(f"{k}:{v}" for k, v in list(state_summary.items())[:5]),
+                "信号数": len(buy_changes),
+            })
 
     df = pd.DataFrame(rows)
     if df.empty:
