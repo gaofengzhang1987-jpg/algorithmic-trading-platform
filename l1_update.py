@@ -32,9 +32,47 @@ SIG_DIR = BASE_DIR / "data" / "signals"
 STATE_FILE = BASE_DIR / "data" / "last_update.txt"
 TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "a201cb89dff50044936fc4554d0751939a56bc9afab8726424ac234e")
 
+MIN_BARS = 120
+ST_PREFIXES = ('ST', '*ST', 'SST', 'S*ST', 'NST')
+BJ_PREFIX = ('8', '9')
+
 # ================================================================
 #  步骤 ①：拉取增量日线
 # ================================================================
+
+def _filter_stock(ts_code: str) -> bool:
+    """返回 True 表示该股票应拉取。跳过 ST/北交所/退市。"""
+    code = ts_code.split('.')[0]
+    if code.startswith(BJ_PREFIX):
+        return False
+    # tushare 的 daily 接口不直接返回 ST 标记，后续通过 stock_basic 判断
+    return True
+
+
+def _filter_stock_basic(daily_df, pro):
+    """根据 stock_basic 过滤 ST 股。"""
+    try:
+        basic = pro.stock_basic(exchange='', list_status='L',
+                                fields='ts_code,name,list_date')
+        st_codes = set()
+        for _, r in basic.iterrows():
+            name = str(r.get('name', ''))
+            if any(name.startswith(p) for p in ST_PREFIXES):
+                st_codes.add(r['ts_code'].split('.')[0])
+        return daily_df[~daily_df['ts_code'].apply(
+            lambda x: str(x).split('.')[0]).isin(st_codes)]
+    except:
+        return daily_df  # 过滤失败时直接返回原始数据
+
+
+def _is_new_stock(code: str) -> bool:
+    """日线少于 120 根 bar 的新股。"""
+    fpath = DAILY_DIR / f"{code}.parquet"
+    if not fpath.exists():
+        return True
+    df = pd.read_parquet(fpath, columns=['date'])
+    return len(df) < MIN_BARS
+
 
 def get_last_update_date():
     if STATE_FILE.exists():
@@ -47,8 +85,7 @@ def pull_daily(end_date: str, dry_run=False):
     ts.set_token(TUSHARE_TOKEN)
     pro = ts.pro_api()
     last_date = get_last_update_date()
-    today = datetime.now()
-    target_end = datetime.strptime(end_date, "%Y-%m-%d") if end_date else today
+    target_end = datetime.strptime(end_date, "%Y-%m-%d") if end_date else datetime.now()
 
     start = last_date + timedelta(days=1)
     if start > target_end:
@@ -58,76 +95,72 @@ def pull_daily(end_date: str, dry_run=False):
     start_str = start.strftime("%Y%m%d")
     end_str = target_end.strftime("%Y%m%d")
     logger.info("拉取日线: %s → %s", start_str, end_str)
-
     if dry_run:
         logger.info("[DRY-RUN] 跳过实际拉取")
         return 0, target_end
 
-    updated = set()
     existing_codes = set(p.stem for p in DAILY_DIR.glob("*.parquet"))
-    
+    updated = set()
+
     try:
-        df = pro.daily(trade_date=end_str)
+        df = pro.daily(start_date=start_str, end_date=end_str)
         if df is not None and not df.empty:
-            for _, row in df.iterrows():
-                code = str(row['ts_code']).split('.')[0]
-                if code in existing_codes:
-                    fpath = DAILY_DIR / f"{code}.parquet"
-                    existing = pd.read_parquet(fpath)
-                    existing['date'] = pd.to_datetime(existing['date'])
-                    new_row = {
-                        'date': pd.Timestamp(target_end),
-                        'code': code,
-                        'open': float(row['open']),
-                        'high': float(row['high']),
-                        'low': float(row['low']),
-                        'close': float(row['close']),
-                        'volume': float(row['vol']),
-                        'amount': float(row['amount']),
-                    }
-                    existing = pd.concat([existing, pd.DataFrame([new_row])], ignore_index=True)
-                    existing = existing.drop_duplicates('date', keep='last').sort_values('date')
-                    existing.to_parquet(fpath, index=False)
+            df = df[df.apply(lambda r: _filter_stock(str(r['ts_code'])), axis=1)]  # 过滤 ST/北交
+            for code, group in df.groupby(df['ts_code'].apply(lambda x: str(x).split('.')[0])):
+                if dry_run:
                     updated.add(code)
+                    continue
+                fpath = DAILY_DIR / f"{code}.parquet"
+                bars = []
+                for _, r in group.iterrows():
+                    bars.append({
+                        'date': pd.Timestamp(str(r['trade_date'])),
+                        'code': code,
+                        'open': float(r['open']), 'high': float(r['high']),
+                        'low': float(r['low']), 'close': float(r['close']),
+                        'volume': float(r['vol']), 'amount': float(r['amount']),
+                    })
+                new_df = pd.DataFrame(bars)
+                if fpath.exists():
+                    old_df = pd.read_parquet(fpath)
+                    combined = pd.concat([old_df, new_df], ignore_index=True)
+                else:
+                    combined = new_df
+                combined = combined.drop_duplicates('date', keep='last').sort_values('date')
+                combined.to_parquet(fpath, index=False)
+                updated.add(code)
     except Exception as e:
-        logger.warning("日线拉取部分失败: %s", str(e)[:100])
+        logger.warning("日线拉取失败: %s", str(e)[:100])
 
-    # 也拉 A 股列表确保覆盖
+    # 拉取上证指数
     try:
-        stocks = pro.stock_basic(exchange='', list_status='L',
-                                 fields='ts_code,symbol,name,list_date')
-        active = set()
-        for _, r in stocks.iterrows():
-            ldate = str(r.get('list_date', ''))
-            if ldate < end_str.replace('-', ''):
-                active.add(r['symbol'])
-        new_codes = active - existing_codes
-        if new_codes:
-            logger.info("新增 %d 只股票，批量拉取历史数据...", len(new_codes))
-            for code in list(new_codes)[:50]:  # 每轮最多加 50 只新股
-                try:
-                    hdf = pro.daily(ts_code=f"{code}.SZ", start_date='20200101', end_date=end_str)
-                    if hdf is None or hdf.empty:
-                        hdf = pro.daily(ts_code=f"{code}.SH", start_date='20200101', end_date=end_str)
-                    if hdf is not None and not hdf.empty:
-                        bars = []
-                        for _, r in hdf.iterrows():
-                            bars.append({
-                                'date': pd.Timestamp(str(r['trade_date'])),
-                                'code': code, 'open': float(r['open']), 'high': float(r['high']),
-                                'low': float(r['low']), 'close': float(r['close']),
-                                'volume': float(r['vol']), 'amount': float(r['amount']),
-                            })
-                        df_new = pd.DataFrame(bars).sort_values('date')
-                        df_new.to_parquet(DAILY_DIR / f"{code}.parquet", index=False)
-                        updated.add(code)
-                except: pass
+        idx_df = pro.index_daily(ts_code='000001.SH',
+                                 start_date=start_str, end_date=end_str)
+        if idx_df is not None and not idx_df.empty:
+            idx_path = BASE_DIR / "data/index/000001.parquet"
+            idx_bars = []
+            for _, r in idx_df.iterrows():
+                idx_bars.append({
+                    'date': pd.Timestamp(str(r['trade_date'])),
+                    'open': float(r['open']), 'high': float(r['high']),
+                    'low': float(r['low']), 'close': float(r['close']),
+                    'volume': float(r['vol']),
+                    'code': '000001',
+                })
+            new_idx = pd.DataFrame(idx_bars)
+            if idx_path.exists():
+                old_idx = pd.read_parquet(idx_path)
+                combined = pd.concat([old_idx, new_idx], ignore_index=True)
+            else:
+                combined = new_idx
+            combined = combined.drop_duplicates('date', keep='last').sort_values('date')
+            combined.to_parquet(idx_path, index=False)
+            logger.info("上证指数更新: %d 条", len(idx_bars))
     except Exception as e:
-        logger.warning("新股拉取失败: %s", str(e)[:100])
+        logger.warning("上证指数拉取失败: %s", str(e)[:80])
 
-    # 保存状态
     STATE_FILE.write_text(target_end.strftime("%Y-%m-%d"))
-    logger.info("日线更新: %d 只股票有变化", len(updated))
+    logger.info("日线更新: %d 只股票", len(updated))
     return len(updated), target_end
 
 
