@@ -35,6 +35,7 @@ TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "a201cb89dff50044936fc4554d07519
 MIN_BARS = 120
 ST_PREFIXES = ('ST', '*ST', 'SST', 'S*ST', 'NST')
 BJ_PREFIX = ('8', '9')
+MIN30_DIR = BASE_DIR / "data/min30"
 
 # ================================================================
 #  步骤 ①：拉取增量日线
@@ -162,6 +163,61 @@ def pull_daily(end_date: str, dry_run=False):
     STATE_FILE.write_text(target_end.strftime("%Y-%m-%d"))
     logger.info("日线更新: %d 只股票", len(updated))
     return len(updated), target_end
+
+
+def pull_min30(dry_run=False, last_days=30) -> int:
+    """拉取最近 last_days 天的 30 分钟数据。返回更新股票数。"""
+    import akshare as ak
+
+    codes = sorted(p.stem for p in DAILY_DIR.glob("*.parquet"))
+    logger.info("拉取 30 分钟数据: %d 只, 最近 %d 天", len(codes), last_days)
+    if dry_run:
+        return 0
+
+    updated = 0
+    for code in codes:
+        try:
+            df_5min = ak.stock_zh_a_minute(symbol=code, period='5', adjust='qfq')
+            if df_5min is None or df_5min.empty:
+                continue
+            df_5min = df_5min.rename(columns={'day': 'date'}).copy()
+            df_5min['date'] = pd.to_datetime(df_5min['date'])
+
+            # 只保留最近 last_days 天
+            cutoff = pd.Timestamp.now() - pd.Timedelta(days=last_days)
+            df_5min = df_5min[df_5min['date'] >= cutoff]
+
+            # 重采样为 30 分钟
+            df_5min = df_5min.set_index('date')
+            ohlc = df_5min['price'].resample('30T').ohlc()
+            volume = df_5min['volume'].resample('30T').sum()
+
+            df_30min = pd.DataFrame({
+                'date': ohlc.index,
+                'open': ohlc['open'], 'high': ohlc['high'],
+                'low': ohlc['low'], 'close': ohlc['close'],
+                'volume': volume,
+                'code': code,
+            }).reset_index(drop=True)
+            df_30min = df_30min.dropna(subset=['open'])
+
+            fpath = MIN30_DIR / f"{code}.parquet"
+            if fpath.exists():
+                old = pd.read_parquet(fpath)
+                combined = pd.concat([old, df_30min], ignore_index=True)
+                combined = combined.drop_duplicates('date', keep='last').sort_values('date')
+            else:
+                combined = df_30min
+            combined.to_parquet(fpath, index=False)
+            updated += 1
+        except Exception as e:
+            logger.debug("30 分钟数据拉取失败 %s: %s", code, str(e)[:60])
+
+        if (codes.index(code) + 1) % 500 == 0:
+            logger.info("30 分钟: %d/%d", codes.index(code) + 1, len(codes))
+
+    logger.info("30 分钟数据完成: %d 只更新", updated)
+    return updated
 
 
 # ================================================================
