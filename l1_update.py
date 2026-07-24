@@ -36,6 +36,7 @@ MIN_BARS = 120
 ST_PREFIXES = ('ST', '*ST', 'SST', 'S*ST', 'NST')
 BJ_PREFIX = ('8', '9')
 MIN30_DIR = BASE_DIR / "data/min30"
+MIN30_DIR.mkdir(parents=True, exist_ok=True)
 
 # ================================================================
 #  步骤 ①：拉取增量日线
@@ -175,12 +176,12 @@ def pull_min30(dry_run=False, last_days=30) -> int:
         return 0
 
     updated = 0
-    for code in codes:
+    for i, code in enumerate(codes):
         try:
             df_5min = ak.stock_zh_a_minute(symbol=code, period='5', adjust='qfq')
             if df_5min is None or df_5min.empty:
                 continue
-            df_5min = df_5min.rename(columns={'day': 'date'}).copy()
+            df_5min = df_5min.rename(columns={'day': 'date'})
             df_5min['date'] = pd.to_datetime(df_5min['date'])
 
             # 只保留最近 last_days 天
@@ -192,11 +193,15 @@ def pull_min30(dry_run=False, last_days=30) -> int:
             ohlc = df_5min['price'].resample('30T').ohlc()
             volume = df_5min['volume'].resample('30T').sum()
 
+            # Resample amount
+            amount = df_5min['amount'].resample('30T').sum() if 'amount' in df_5min.columns else None
+            
             df_30min = pd.DataFrame({
                 'date': ohlc.index,
                 'open': ohlc['open'], 'high': ohlc['high'],
                 'low': ohlc['low'], 'close': ohlc['close'],
                 'volume': volume,
+                'amount': amount.reindex(ohlc.index, fill_value=0.0) if amount is not None else 0.0,
                 'code': code,
             }).reset_index(drop=True)
             df_30min = df_30min.dropna(subset=['open'])
@@ -213,8 +218,8 @@ def pull_min30(dry_run=False, last_days=30) -> int:
         except Exception as e:
             logger.debug("30 分钟数据拉取失败 %s: %s", code, str(e)[:60])
 
-        if (codes.index(code) + 1) % 500 == 0:
-            logger.info("30 分钟: %d/%d", codes.index(code) + 1, len(codes))
+        if (i + 1) % 500 == 0:
+            logger.info("30 分钟: %d/%d", i + 1, len(codes))
 
     logger.info("30 分钟数据完成: %d 只更新", updated)
     return updated
