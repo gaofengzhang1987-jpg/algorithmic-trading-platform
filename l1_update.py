@@ -112,6 +112,7 @@ def pull_daily(end_date: str, dry_run=False):
         df = pro.daily(start_date=start_str, end_date=end_str)
         if df is not None and not df.empty:
             df = df[df.apply(lambda r: _filter_stock(str(r['ts_code'])), axis=1)]  # 过滤 ST/北交
+            df = _filter_stock_basic(df, pro)  # 过滤 ST 股
             for code, group in df.groupby(df['ts_code'].apply(lambda x: str(x).split('.')[0])):
                 if dry_run:
                     updated.add(code)
