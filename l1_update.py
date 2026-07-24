@@ -2,17 +2,19 @@
 """L1 增量更新流水线：日线拉取 → 信号重生 → L1-L4 打分。
 
 流程：
-  ① 拉取增量日线 (tushare, 从上轮截止日至今)
-  ② 识别有新数据的股票
-  ③ 删旧信号文件 → CZSC 重生 (init_n=300)
-  ④ L1→L2 打分
-  ⑤ L3 过滤
-  ⑥ L4 排名
+   ① 拉日线 (tushare) + 上证指数
+   ② 拉 30 分钟数据 (akshare)
+   ③ CZSC 信号重生 (4 片 nohup 并行)
+   ④ RPS 增量刷新 (rps_calc.py refresh)
+   ⑤ L1 打分
+   ⑥ L3 过滤
+   ⑦ L4 排名
 
 用法：
-  python3 l1_update.py           # 完整流水线 (默认截止今天)
-  python3 l1_update.py --dry-run # 仅检查、不执行
-  python3 l1_update.py --end 2026-07-15  # 指定截止日期
+  python3 l1_update.py                # 完整流水线 (默认截止今天)
+  python3 l1_update.py --dry-run      # 仅检查、不执行
+  python3 l1_update.py --end 2026-07-15       # 指定截止日期
+  python3 l1_update.py --skip-rps     # 跳过 RPS 刷新
 """
 
 import logging, os, sys, time, argparse
@@ -391,8 +393,8 @@ def _run_serial_signals() -> int:
 
 
 # ================================================================
-#  步骤 ④⑤⑥：L1→L4 流水线
 # ================================================================
+#  步骤 ⑤⑥⑦：L1→L4 流水线
 
 def run_l1_l4():
     """运行 L1 打分 → L3 过滤 → L4 排名。"""
@@ -413,6 +415,23 @@ def run_l1_l4():
 
 
 # ================================================================
+#  步骤 ④：RPS 增量刷新
+# ================================================================
+
+def refresh_rps(dry_run=False):
+    """RPS 增量刷新。"""
+    logger.info("=== RPS 增量刷新 ===")
+    if dry_run:
+        logger.info("[DRY-RUN] 跳过")
+        return
+    ret = subprocess.run(['python3', str(BASE_DIR / 'rps_calc.py'), 'refresh'],
+                         capture_output=True, text=True)
+    if ret.returncode != 0:
+        logger.warning("RPS 刷新返回码 %d: %s", ret.returncode, ret.stderr[:200])
+    else:
+        for line in ret.stdout.strip().split(chr(92)+chr(110)):
+            logger.info("  %s", line)
+# ================================================================
 #  主入口
 # ================================================================
 
@@ -422,25 +441,36 @@ def main():
     parser.add_argument("--end", type=str, help="截止日期 YYYY-MM-DD")
     parser.add_argument("--skip-pull", action="store_true", help="跳过日线拉取")
     parser.add_argument("--skip-signals", action="store_true", help="跳过信号重生")
+    parser.add_argument("--skip-rps", action="store_true", help="跳过 RPS 刷新")
     parser.add_argument("--skip-l1l4", action="store_true", help="跳过 L1-L4 打分")
     args = parser.parse_args()
     
     start_ts = time.time()
     
-    # ① 拉取日线
+    # Step ① 拉日线 + 上证指数
     if not args.skip_pull:
         n, end_date = pull_daily(args.end, args.dry_run)
         logger.info("步骤①完成: %d 只更新, 截止 %s", n, end_date.strftime("%Y-%m-%d"))
+   
+    # Step ② 拉 30 分钟数据（与日线同开关）
+    if not args.skip_pull:
+        n30 = pull_min30(dry_run=args.dry_run)
+        logger.info("步骤②完成: %d 只更新", n30)
     
-    # ②③ 重生信号
+    # Step ③ CZSC 信号重生
     if not args.skip_signals and not args.dry_run:
         n_sig = regenerate_signals()
-        logger.info("步骤②③完成: %d 只信号重生", n_sig)
+        logger.info("步骤③完成: %d 只信号", n_sig)
     
-    # ④⑤⑥ L1→L4
+    # Step ④ RPS 刷新
+    if not args.skip_rps and not args.dry_run:
+        refresh_rps()
+        logger.info("步骤④完成")
+    
+    # Step ⑤⑥⑦ L1→L4
     if not args.skip_l1l4 and not args.dry_run:
         run_l1_l4()
-        logger.info("步骤④⑤⑥完成")
+        logger.info("步骤⑤⑥⑦完成")
     
     elapsed = int(time.time() - start_ts)
     logger.info("流水线完成, 总耗时 %ds", elapsed)
