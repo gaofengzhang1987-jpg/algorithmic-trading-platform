@@ -19,6 +19,8 @@ import logging, os, sys, time, argparse
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import Counter
+import json
+import subprocess
 
 import pandas as pd
 import tushare as ts
@@ -227,57 +229,164 @@ def pull_min30(dry_run=False, last_days=30) -> int:
 
 # ================================================================
 #  步骤 ②③：识别变化股票 → 重生 CZSC 信号 (init_n=300)
+#  4 片 nohup 并行（B 方案）→ 失败回退单线程（A 方案）
 # ================================================================
 
+CHUNK_COUNT = 4
+WAIT_TIMEOUT = 600  # 最多等 10 分钟
+FAIL_THRESHOLD = 0.1  # 失败超 10% 回退
+
+
 def regenerate_signals(dry_run=False):
-    """删旧信号 → CZSC 重生，仅处理日线中有数据的股票。"""
+    """CZSC 信号重生。默认 4 片 nohup 并行，失败回退单线程。"""
+    daily_codes = sorted(p.stem for p in DAILY_DIR.glob("*.parquet"))
+    logger.info("CZSC 信号重生: %d 只", len(daily_codes))
+
+    if dry_run:
+        new_codes = [c for c in daily_codes if _is_new_stock(c)]
+        logger.info(
+            "[DRY-RUN] 跳过新股 %d 只，其余 %d 只需要信号生成",
+            len(new_codes), len(daily_codes) - len(new_codes),
+        )
+        return 0
+
+    # B 方案：4 片 nohup 并行
+    if _run_chunks_b():
+        return _aggregate_chunk_results()
+
+    # B 方案失败，回退 A 方案
+    logger.warning("并行方案失败，回退单线程串行")
+    return _run_serial_signals()
+
+
+def _run_chunks_b() -> bool:
+    """启动 4 个 nohup 进程。返回 True 表示全部成功。"""
+    _time = __import__("time")
+    chunk_script = BASE_DIR / "tmp_out" / "signal_chunk.py"
+
+    if not chunk_script.exists():
+        logger.error("signal_chunk.py 不存在: %s", chunk_script)
+        return False
+
+    # 清理旧的 result 文件
+    for i in range(CHUNK_COUNT):
+        rf = BASE_DIR / "tmp_out" / f"chunk_{i}_result.json"
+        if rf.exists():
+            rf.unlink()
+
+    for i in range(CHUNK_COUNT):
+        cmd = (
+            f"nohup python3 {chunk_script} "
+            f"--chunk {i}/{CHUNK_COUNT} "
+            f"> {BASE_DIR}/tmp_out/chunk_{i}.log 2>&1 &"
+        )
+        subprocess.run(cmd, shell=True)
+
+    logger.info("已启动 %d 个 nohup 进程:", CHUNK_COUNT)
+    for i in range(CHUNK_COUNT):
+        logger.info("  chunk %d/%d → tail -f tmp_out/chunk_%d.log", i, CHUNK_COUNT, i)
+    logger.info("等待分片完成...")
+
+    # 轮询等待完成
+    waited = 0
+    while waited < WAIT_TIMEOUT:
+        done = [
+            (BASE_DIR / "tmp_out" / f"chunk_{i}_result.json").exists()
+            for i in range(CHUNK_COUNT)
+        ]
+        if all(done):
+            results = []
+            for i in range(CHUNK_COUNT):
+                rf = BASE_DIR / "tmp_out" / f"chunk_{i}_result.json"
+                results.append(json.loads(rf.read_text()))
+
+            total_failed = sum(r["failed"] for r in results)
+            total_success = sum(r["success"] for r in results)
+            total_skipped = sum(r["skipped"] for r in results)
+            total = total_success + total_failed + total_skipped
+            total_elapsed = max(r["elapsed"] for r in results)
+
+            logger.info(
+                "分片完成: %d 成功, %d 失败, %d 跳过, %.0fs",
+                total_success, total_failed, total_skipped, total_elapsed,
+            )
+
+            if total > 0 and total_failed > total * FAIL_THRESHOLD:
+                logger.warning(
+                    "失败率 %.1f%% 超阈值 %.0f%%，回退单线程",
+                    total_failed / total * 100, FAIL_THRESHOLD * 100,
+                )
+                return False
+            return True
+
+        _time.sleep(30)
+        waited += 30
+        logger.info("等待中... %ds", waited)
+
+    logger.error("分片超时（%ds），回退单线程", WAIT_TIMEOUT)
+    return False
+
+
+def _aggregate_chunk_results() -> int:
+    """汇总分片结果，返回成功数。"""
+    total = 0
+    for i in range(CHUNK_COUNT):
+        rf = BASE_DIR / "tmp_out" / f"chunk_{i}_result.json"
+        if rf.exists():
+            r = json.loads(rf.read_text())
+            total += r["success"]
+    return total
+
+
+def _run_serial_signals() -> int:
+    """A 方案：单线程串行 CZSC 信号重生。"""
     from czsc import RawBar, Freq, generate_czsc_signals
     from signal_config import get_config
 
     daily_codes = sorted(p.stem for p in DAILY_DIR.glob("*.parquet"))
-    sig_config = get_config(freq='日线')
+    sig_config = get_config(freq="日线")
 
     total = len(daily_codes)
-    success = 0
-    t0 = time.time()
-    
-    logger.info("CZSC 信号重生 (init_n=300, %d 只)", total)
-    
+    success, t0 = 0, time.time()
+    progress_path = BASE_DIR / "tmp_out" / "signal_progress.txt"
+
+    logger.info("CZSC 信号重生 单线程 (init_n=300, %d 只)", total)
+
     for i, code in enumerate(daily_codes):
+        if _is_new_stock(code):
+            continue
         try:
-            df = pd.read_parquet(DAILY_DIR / f"{code}.parquet")
-            if len(df) < 30:
-                continue
-            
-            df = df.sort_values('date')
-            bars = []
-            for j, (_, row) in enumerate(df.iterrows()):
-                bars.append(RawBar(
-                    symbol=str(row.get("code", code)), id=j+1,
-                    dt=row["date"].to_pydatetime(), freq=Freq.D,
-                    open=row["open"], close=row["close"],
-                    high=row["high"], low=row["low"],
-                    vol=row.get("volume", 0),
-                    amount=row.get("amount", 0),
-                ))
-            
-            sigs_df = generate_czsc_signals(bars, signals_config=sig_config,
-                                            sdt="20200101", init_n=min(300, len(bars)), df=True)
-            if sigs_df is not None and not sigs_df.empty:
-                sigs_df = sigs_df.drop(columns=[c for c in ["freq", "cache"] if c in sigs_df.columns])
-                sigs_df.to_parquet(SIG_DIR / f"{code}.parquet", index=False)
+            df = pd.read_parquet(DAILY_DIR / f"{code}.parquet").sort_values("date")
+            bars = [
+                RawBar(
+                    symbol=code, id=j + 1, dt=r["date"].to_pydatetime(),
+                    freq=Freq.D, open=r["open"], close=r["close"],
+                    high=r["high"], low=r["low"],
+                    vol=r.get("volume", 0), amount=r.get("amount", 0),
+                )
+                for j, (_, r) in enumerate(df.iterrows())
+            ]
+            sigs = generate_czsc_signals(
+                bars, signals_config=sig_config,
+                sdt="20200101", init_n=min(300, len(bars)), df=True,
+            )
+            if sigs is not None and not sigs.empty:
+                sigs = sigs.drop(columns=[c for c in ["freq", "cache"] if c in sigs.columns])
+                sigs.to_parquet(SIG_DIR / f"{code}.parquet", index=False)
                 success += 1
         except Exception as e:
             logger.debug("%s: %s", code, str(e)[:80])
-        
+
         if (i + 1) % 500 == 0:
             elapsed = time.time() - t0
             rate = (i + 1) / elapsed
             eta = (total - i - 1) / rate if rate > 0 else 0
-            logger.info("信号: %d/%d (%d 成功) %.1f/s ETA %.0fs", i+1, total, success, rate, eta)
-    
+            msg = f"[serial] {i + 1}/{total} 成功{success} {rate:.1f}只/s ETA {eta:.0f}s"
+            progress_path.write_text(msg)
+            logger.info(msg)
+
     elapsed = time.time() - t0
-    logger.info("信号重生完成: %d/%d 成功, 耗时 %.0fs", success, total, elapsed)
+    logger.info("单线程信号完成: %d/%d 成功, 耗时 %.0fs", success, total, elapsed)
     return success
 
 
