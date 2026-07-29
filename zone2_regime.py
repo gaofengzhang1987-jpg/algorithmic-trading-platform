@@ -23,6 +23,8 @@ ZONES = BASE / "data" / "zones"
 
 # Per-run resonance caches
 _weekly_res_cache = {}
+_weekly_dt_cache = {}
+_30min_dt_cache = {}
 _30min_res_cache = {}
 
 WEEKLY_SIG = BASE / "data" / "signals_weekly"
@@ -30,13 +32,20 @@ W_B1 = "周线_D1B_BUY1"; W_BS2 = "周线_D1#SMA#21_BS2辅助V230320"
 W_BS3 = "周线_D1#SMA#34_BS3辅助V230318"; W_SAN = "周线_D1_三买辅助V230228"
 W_SAN2 = "周线_D1#SMA#34_BS3辅助V230319"
 
-def _check_weekly_resonance(code):
+def _check_weekly_resonance(code, signal_dt=None):
     if code in _weekly_res_cache:
         return _weekly_res_cache[code]
     wp = WEEKLY_SIG / f"{code}.parquet"
     if not wp.exists(): return None
     try:
-        w = pd.read_parquet(wp); last = w.iloc[-1]
+        w = pd.read_parquet(wp)
+        if signal_dt is not None:
+            w_dt = pd.to_datetime(w["dt"])
+            idx = (w_dt - signal_dt).abs().idxmin()
+            last = w.iloc[idx]
+        else:
+            last = w.iloc[-1]
+        last_dt = pd.Timestamp(last["dt"])
         wtypes = set()
         for col, bt in [(W_B1,"一买"),(W_BS2,"二买"),(W_BS3,"三买"),(W_SAN,"三买"),(W_SAN2,"三买")]:
             if col in w.columns:
@@ -44,9 +53,11 @@ def _check_weekly_resonance(code):
                 if bt in v and v != "0": wtypes.add(bt)
         r = wtypes if wtypes else set()
         _weekly_res_cache[code] = r
+        _weekly_dt_cache[code] = last_dt
         return r
     except:
         _weekly_res_cache[code] = None
+        _weekly_dt_cache[code] = None
         return None
 
 M30_SIG = BASE / "data" / "signals_30min"
@@ -54,13 +65,20 @@ M_B1 = "30分钟_D1B_BUY1"; M_BS2 = "30分钟_D1#SMA#21_BS2辅助V230320"
 M_BS3 = "30分钟_D1#SMA#34_BS3辅助V230318"; M_SAN = "30分钟_D1_三买辅助V230228"
 M_SAN2 = "30分钟_D1#SMA#34_BS3辅助V230319"
 
-def _check_30min_resonance(code):
+def _check_30min_resonance(code, signal_dt=None):
     if code in _30min_res_cache:
         return _30min_res_cache[code]
     mp = M30_SIG / f"{code}.parquet"
     if not mp.exists(): return None
     try:
-        m = pd.read_parquet(mp); last = m.iloc[-1]
+        m = pd.read_parquet(mp)
+        if signal_dt is not None:
+            m_dt = pd.to_datetime(m["dt"])
+            idx = (m_dt - signal_dt).abs().idxmin()
+            last = m.iloc[idx]
+        else:
+            last = m.iloc[-1]
+        last_dt = pd.Timestamp(last["dt"])
         mtypes = set()
         for col, bt in [(M_B1,"一买"),(M_BS2,"二买"),(M_BS3,"三买"),(M_SAN,"三买"),(M_SAN2,"三买")]:
             if col in m.columns:
@@ -68,9 +86,11 @@ def _check_30min_resonance(code):
                 if bt in v and v != "0": mtypes.add(bt)
         r = mtypes if mtypes else set()
         _30min_res_cache[code] = r
+        _30min_dt_cache[code] = last_dt
         return r
     except:
         _30min_res_cache[code] = None
+        _30min_dt_cache[code] = None
         return None
 
 # Map EntryFilter dimension_scores to legacy L2/L3/L4 column names
@@ -154,15 +174,25 @@ def run(input_df=None, regime="CHOP", bplus_codes=None):
 
             # 多级别共振标识：二级(周×日×共振) / 三级联立(周×日×30m×共振)
             # 附加到买点类型标签后面，三级联立直通（加入 bplus_codes）
-            wtypes = _check_weekly_resonance(code)
-            r30 = _check_30min_resonance(code)
+            signal_dt = pd.Timestamp(date_str)
+            wtypes = _check_weekly_resonance(code, signal_dt)
+            r30 = _check_30min_resonance(code, signal_dt)
             resonance_suffix = ""
             is_three_level = False
             if wtypes is not None and buy_type in wtypes:
+                # 时间对齐：周线最后bar需在信号日±5交易日内
+                week_ok = True
+                if code in _weekly_dt_cache and _weekly_dt_cache[code] is not None:
+                    week_ok = abs((_weekly_dt_cache[code] - signal_dt).days) <= 5
                 if r30 is not None and buy_type in r30:
-                    resonance_suffix = " [周_日_30m_联立]"
-                    is_three_level = True
-                else:
+                    # 时间对齐：30m最后bar需在信号日±2交易日内
+                    m30_ok = True
+                    if code in _30min_dt_cache and _30min_dt_cache[code] is not None:
+                        m30_ok = abs((_30min_dt_cache[code] - signal_dt).days) <= 2
+                    if m30_ok:
+                        resonance_suffix = " [周_日_30m_联立]"
+                        is_three_level = True
+                elif week_ok:
                     resonance_suffix = " [周_日_共振]"
 
             buy_event = {"date": date_str, "signal_label": sig_val, "col": col_name}

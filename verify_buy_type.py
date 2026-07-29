@@ -186,12 +186,8 @@ def _verify_second_buy(code: str):
     struct = pd.read_parquet(sp)
     bis = struct[struct["direction"].isin(["向上", "向下"])].sort_values("sdt")
 
-    # 截断到信号日期：仅当信号在 30 天内触发时才截断（长期保持的信号用全量笔）
-    if signal_date is not None:
-        days_since = (pd.Timestamp.now() - signal_date).days
-        if days_since <= 30:
-            bis = bis[pd.to_datetime(bis["edt"]) <= signal_date]
-
+    # 截断到信号日期：已移除 —— 用全量笔（struct_cache max_bi_num=50），
+    # 避免截断后落入与当前信号无关的远古结构
     if len(bis) < 3:
         return False, "二买_未企稳"
 
@@ -226,8 +222,45 @@ def _verify_second_buy(code: str):
 
 # ========== 三买验证 ==========
 
-def _verify_third_buy(code: str):
+def _find_reference_pivot(code: str, signal_date, struct, daily):
+    """找三买参照中枢。
+
+    信号日前最近的在多头趋势（c > MA20 > MA60 且 MA20 斜率为正）
+    中完成的中枢。忽略 CZSC 的 pivot_dir（上涨/下跌）标签，
+    只用 MA 趋势确认。
+
+    Returns: (pivot_row | None, zg: float)
+    """
+    pivots = struct[struct["direction"] == "pivot"]
+    if pivots.empty:
+        return None, 0
+    completed = pivots[pd.to_datetime(pivots["edt"]) <= signal_date]
+    if completed.empty:
+        return None, 0  # 信号日之前没有完成的中枢
+
+    for _, p in completed.iloc[::-1].iterrows():
+        p_edt = pd.Timestamp(p["edt"])
+        daily_at = daily[daily["date"] <= p_edt]
+        if len(daily_at) < 60:
+            continue
+        c = float(daily_at["close"].iloc[-1])
+        m20 = float(daily_at["close"].rolling(20).mean().iloc[-1])
+        m60 = float(daily_at["close"].rolling(60).mean().iloc[-1])
+        if len(daily_at) >= 26:
+            m20_prev = float(daily_at["close"].rolling(20).mean().iloc[-6])
+            slope = (m20 - m20_prev) / m20_prev * 100 if m20_prev > 0 else 0
+        else:
+            slope = 0
+        if c > m20 > m60 and slope > 0:
+            return p, float(p["pivot_zg"])
+    return None, 0
+
+
+def _verify_third_buy(code: str, signal_date=None):
     """三买验证 + 细分标签。
+
+    signal_date: 信号触发日期（用于确定参照中枢的截止时间），
+                 默认从信号文件自动推断。
 
     Returns: (passed: bool, tag: str)
     """
@@ -235,30 +268,53 @@ def _verify_third_buy(code: str):
     if not sp.exists():
         return False, ""
     struct = pd.read_parquet(sp)
-    pivots = struct[struct["direction"] == "pivot"]
-    up_pivots = pivots[pivots["pivot_dir"] == "上涨"]
-    if up_pivots.empty:
-        return False, "三买_无中枢基础"
 
-    last_pivot = up_pivots.iloc[-1]
-    zg = float(last_pivot["pivot_zg"])
+    dp = DAILY_DIR / f"{code}.parquet"
+    if not dp.exists():
+        return False, "三买_跌破中枢"
+    daily = pd.read_parquet(dp).sort_values("date")
+
+    # 信号日期：优先传入值，否则从信号文件找三买首次触发日，兜底日线末日期
+    if signal_date is None:
+        try:
+            sf = pd.read_parquet(SIG_DIR / f"{code}.parquet")
+            for col in sf.columns:
+                if "三买" not in col:
+                    continue
+                vals = sf[col].astype(str)
+                for i in range(len(vals) - 1, 0, -1):
+                    if "三买" in vals.iloc[i] and "三买" not in vals.iloc[i-1]:
+                        signal_date = pd.to_datetime(sf["dt"].iloc[i])
+                        break
+                if signal_date is not None:
+                    break
+        except Exception:
+            pass
+    if signal_date is None:
+        signal_date = daily["date"].iloc[-1]
+
+    pivots = struct[struct["direction"] == "pivot"]
+    if pivots.empty:
+        return False, ""
+    ref, zg = _find_reference_pivot(code, signal_date, struct, daily)
+    if ref is None:
+        return False, "三买_无中枢基础"
     if zg <= 0:
         return False, "三买_无中枢基础"
 
-    bis = struct[struct["direction"].isin(["向上", "向下"])].sort_values("sdt")  # sdt: chronological order, edt can misorder short bis
-    pivot_end = pd.to_datetime(last_pivot["edt"])
+    bis = struct[struct["direction"].isin(["向上", "向下"])].sort_values("sdt")
+    pivot_end = pd.to_datetime(ref["edt"])
     after_pivot = bis[pd.to_datetime(bis["sdt"]) >= pivot_end]
     up_after = after_pivot[after_pivot["direction"] == "向上"]
     if up_after.empty:
         return False, "三买_未突破中枢"
 
-    # 检查所有突破笔（不只看第一根）
     breakout_mask = up_after["high"] > zg
     if not breakout_mask.any():
         return False, "三买_未突破中枢"
-    breakout = up_after[breakout_mask].iloc[0]  # 取第一次有效突破
+    breakout = up_after[breakout_mask].iloc[0]
 
-    bis_after = after_pivot.sort_values("sdt")  # sdt: chronological order, edt can misorder short bis
+    bis_after = after_pivot.sort_values("sdt")
     tag = "三买_类"
     if len(bis_after) >= 2 and bis_after.iloc[-1]["direction"] == "向下":
         retrace = bis_after.iloc[-1]
@@ -269,15 +325,37 @@ def _verify_third_buy(code: str):
         if breakout_pct > 0.05 and has_fx:
             tag = "三买_标准"
         elif has_fx:
-            tag = "三买_弱突破"  # 突破幅度 < 5% ZG
+            tag = "三买_弱突破"
         else:
             tag = "三买_类"
 
-    dp = DAILY_DIR / f"{code}.parquet"
-    if not dp.exists():
-        return False, "三买_跌破中枢"
-    price = float(pd.read_parquet(dp).sort_values("date").iloc[-1]["close"])
+    price = float(daily.iloc[-1]["close"])
     if price < zg:
         return False, "三买_跌破中枢"
 
+    if price > zg * 1.5:
+        return False, "三买_远离入场区"
     return True, tag
+
+"""B+ 结构验证器 + 买点细分标签。
+
+verify_buy_type(code, buy_type) -> bool     B+ 验证（原接口不变）
+get_buy_type_tag(code, buy_type) -> str     返回细分标签
+"""
+import pandas as pd
+from pathlib import Path
+
+LOOKBACK_DAYS = 120
+ZG_UPPER_RATIO = 1.2
+BUY1_COL = "日线_D1B_BUY1"
+BS2_COL = "日线_D1#SMA#21_BS2辅助V230320"  # 二买信号列
+
+
+WORKDIR = Path(__file__).resolve().parent
+SIG_DIR = WORKDIR / "data" / "signals"
+STRUCT_DIR = WORKDIR / "data" / "struct_cache"
+DAILY_DIR = WORKDIR / "data" / "daily"
+
+
+# ========== 验证入口（原接口不变）==========
+

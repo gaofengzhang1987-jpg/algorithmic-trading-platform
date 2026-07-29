@@ -73,6 +73,30 @@
 
 **Thread hygiene**：当单线程累计消耗超过 ~500K tokens 时（逐级递增的趋势说明上下文已饱和），在响应末尾提示当前线程已接近长上下文边界，建议存档后开新线程，避免进入单次调用数百万 tokens 的指数增长区。
 
+## CodeGraph 健康检查规则（2026-07-29 新增）
+
+> 2026-07-28 踩坑：CodeGraph daemon 被 watchdog 杀死 4 次（主线程 60s 无响应），
+> 崩溃期间 Codex 回退到 grep/read 模式，单次线程消耗 87.6M tokens。
+
+**原则：每次 Codex 会话开始时，必须先确认 CodeGraph 可用。**
+
+### 启动检查流程
+
+1. **会话首轮**：Agent 必须调用一次 `codegraph_explore` 验证 daemon 响应
+2. **daemon 不可用时**：
+   - 检查 `.codegraph/daemon.log` 是否有 `unresponsive` 或 `killing` 关键字
+   - 如连续崩溃 ≥ 2 次：设置 `CODEGRAPH_NO_WATCHDOG=1` 临时禁用 watchdog
+   - 如仍不可用：重建索引 `codegraph index --force`
+3. **无需 CodeGraph 的纯执行类任务**（跑脚本、看结果）可跳过检查
+
+### 崩溃恢复
+
+```
+✅ PID 文件存在且 daemon 响应 → 正常使用 CodeGraph
+✅ daemon 崩溃 → 先排查 log，再决定重启/重建索引
+❌ daemon 崩溃后 Agent 默默回退 grep → 上下文指数膨胀
+```
+
 ---
 
 ## 大规模脚本运行规范（2026-07-23 新增）
@@ -145,4 +169,74 @@
        if out_path.exists(): continue  # 续跑
        process(f)
 ❌ rm -rf output_dir && process_all()  # 中断后从头跑
+```
+
+
+### 六、批量任务 PTY 输出规范（2026-07-28 新增）
+
+> 2026-07-28 30m 信号生成踩坑：`generate_czsc_signals` 内部 `tqdm` 进度条
+> 逐 bar 打印更新，67 只股票 x 6190 bar x ~50 字符/更新 -> ~100K token
+> 被 PTY 捕获后视为 token 消耗。
+>
+> 不限于此——**任何批量任务产生的大规模 stdout 都会被 PTY 捕获为 token**。
+
+**原则：批量脚本的三类输出必须去 stdout 化。**
+
+| 输出类型 | 目标 | 示例 |
+|----------|------|------|
+| 进度 | 写磁盘文件 | `open("progress.txt","w") + f.write(msg)` |
+| 最终结果 | `.parquet` / `.json` / `.csv` | `df.to_parquet(out_path)` |
+| 调试/错误 | 重定向到 `.log` 文件 | `python3 script.py > script.log 2>&1` |
+
+**批量脚本模板**：
+
+```python
+# 进度写文件，不写 stdout
+with open(progress_file, "w") as pf:
+    pf.write(f"{done}/{total}
+")
+
+# 结果写 parquet，不打印
+df.to_parquet(out_path, index=False)
+```
+
+**三类调用必须静默**：
+
+1. **CZSC / tqdm 类**：
+   ```python
+   # ✅ 关 tqdm
+   generate_czsc_signals(bars, signals_config=config, df=True,
+                         tqdm_kwargs={"disable": True})
+   # ✅ 或 stdout 重定向
+   python3 script.py > script.log 2>&1
+   ```
+
+2. **pandas / dataframe 类**：
+   ```python
+   # ❌ print(df) / df.to_string()
+   # ✅ df.to_parquet("output.parquet")
+   # ✅ df.to_csv("output.csv", index=False)
+   ```
+
+3. **子进程类**：
+   ```python
+   # ❌ subprocess.Popen(cmd)  # stdout 继承 PTY
+   # ✅ subprocess.Popen(cmd, stdout=open("cmd.log","w"), stderr=subprocess.STDOUT)
+   ```
+
+**禁止项**：
+
+- 禁止批量运行时不关 tqdm
+- 禁止 `python3 -u`（无缓冲模式）在批量脚本中使用
+- 禁止批量脚本 print 大数据到 stdout
+- 禁止 Agent 通过 `write_stdin` 轮询 PTY 输出获取进度
+
+```
+✅ python3 script.py > script.log 2>&1  # stdout 不进 PTY
+✅ 进度写文件，Agent 读文件
+❌ python3 -u script.py                # 无缓冲 -> tqdm 全量刷 PTY
+❌ 反复 write_stdin 等 stdout 输出
+```
+✅ generate_czsc_signals(..., tqdm_kwargs={"disable": True})
+❌ generate_czsc_signals(...)   # 批量跑不关 tqdm -> token 灾难
 ```

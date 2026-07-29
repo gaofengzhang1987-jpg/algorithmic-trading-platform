@@ -4,7 +4,9 @@
 流程：
    ① 拉日线 (tushare) + 上证指数
    ② 拉 30 分钟数据 (akshare)
-   ③ CZSC 信号重生 (4 片 nohup 并行)
+   ③ CZSC 日线信号重生 (4 片 nohup 并行)
+   ③b CZSC 周线信号重生 (从日线重采样周线K线 → 4 片 nohup 并行)
+   ③c CZSC 30分钟信号重生 (从 data/min30/ → 4 片 nohup 并行)
    ④ RPS 增量刷新 (rps_calc.py refresh)
    ⑤ L1 打分
    ⑥ L3 过滤
@@ -15,6 +17,10 @@
   python3 l1_update.py --dry-run      # 仅检查、不执行
   python3 l1_update.py --end 2026-07-15       # 指定截止日期
   python3 l1_update.py --skip-rps     # 跳过 RPS 刷新
+  python3 l1_update.py --skip-weekly  # 跳过周线信号重生 (③b)
+  python3 l1_update.py --skip-weekly-kline   # 仅跳过周线K线生成 (②b)
+  python3 l1_update.py --skip-weekly-signals # 仅跳过周线CZSC信号 (③b)
+  python3 l1_update.py --skip-30min   # 跳过30分钟信号重生 (③c)
 """
 
 import logging, os, sys, time, argparse
@@ -41,6 +47,12 @@ ST_PREFIXES = ('ST', '*ST', 'SST', 'S*ST', 'NST')
 BJ_PREFIX = ('8', '9')
 MIN30_DIR = BASE_DIR / "data/min30"
 MIN30_DIR.mkdir(parents=True, exist_ok=True)
+WEEKLY_DIR = BASE_DIR / "data" / "weekly"
+WEEKLY_DIR.mkdir(parents=True, exist_ok=True)
+SIG_WEEKLY_DIR = BASE_DIR / "data" / "signals_weekly"
+SIG_WEEKLY_DIR.mkdir(parents=True, exist_ok=True)
+SIG_30MIN_DIR = BASE_DIR / "data" / "signals_30min"
+SIG_30MIN_DIR.mkdir(parents=True, exist_ok=True)
 
 # ================================================================
 #  步骤 ①：拉取增量日线
@@ -180,14 +192,22 @@ def pull_min30(dry_run=False, last_days=30) -> int:
     if dry_run:
         return 0
 
+    def _to_sina(code: str) -> str:
+        if code.startswith(("0", "3")):
+            return f"sz{code}"
+        return f"sh{code}"
+
     updated = 0
     for i, code in enumerate(codes):
         try:
-            df_5min = ak.stock_zh_a_minute(symbol=code, period='5', adjust='qfq')
+            time.sleep(0.25)  # 避免 akshare 限流
+            df_5min = ak.stock_zh_a_minute(symbol=_to_sina(code), period="5", adjust="qfq")
             if df_5min is None or df_5min.empty:
                 continue
             df_5min = df_5min.rename(columns={'day': 'date'})
             df_5min['date'] = pd.to_datetime(df_5min['date'])
+            for col in ['open', 'high', 'low', 'close', 'volume', 'amount']:
+                df_5min[col] = pd.to_numeric(df_5min[col], errors='coerce').fillna(0.0)
 
             # 只保留最近 last_days 天
             cutoff = pd.Timestamp.now() - pd.Timedelta(days=last_days)
@@ -195,21 +215,15 @@ def pull_min30(dry_run=False, last_days=30) -> int:
 
             # 重采样为 30 分钟
             df_5min = df_5min.set_index('date')
-            ohlc = df_5min['price'].resample('30T').ohlc()
-            volume = df_5min['volume'].resample('30T').sum()
-
-            # Resample amount
-            amount = df_5min['amount'].resample('30T').sum() if 'amount' in df_5min.columns else None
+            ohlc = df_5min.resample("30min").agg({
+                'open': 'first', 'high': 'max',
+                'low': 'min', 'close': 'last',
+                'volume': 'sum', 'amount': 'sum',
+            })
             
-            df_30min = pd.DataFrame({
-                'date': ohlc.index,
-                'open': ohlc['open'], 'high': ohlc['high'],
-                'low': ohlc['low'], 'close': ohlc['close'],
-                'volume': volume,
-                'amount': amount.reindex(ohlc.index, fill_value=0.0) if amount is not None else 0.0,
-                'code': code,
-            }).reset_index(drop=True)
-            df_30min = df_30min.dropna(subset=['open'])
+            df_30min = ohlc.dropna(subset=['open']).reset_index()
+            df_30min["code"] = code
+            df_30min = df_30min[["date", "open", "high", "low", "close", "volume", "amount", "code"]]
 
             fpath = MIN30_DIR / f"{code}.parquet"
             if fpath.exists():
@@ -223,7 +237,7 @@ def pull_min30(dry_run=False, last_days=30) -> int:
         except Exception as e:
             logger.debug("30 分钟数据拉取失败 %s: %s", code, str(e)[:60])
 
-        if (i + 1) % 500 == 0:
+        if (i + 1) % 200 == 0:
             logger.info("30 分钟: %d/%d", i + 1, len(codes))
 
     logger.info("30 分钟数据完成: %d 只更新", updated)
@@ -231,8 +245,36 @@ def pull_min30(dry_run=False, last_days=30) -> int:
 
 
 # ================================================================
-#  步骤 ②③：识别变化股票 → 重生 CZSC 信号 (init_n=300)
-#  4 片 nohup 并行（B 方案）→ 失败回退单线程（A 方案）
+#  周线 K 线生成：从日线数据本地重采样
+# ================================================================
+
+def generate_weekly_kline():
+    """从 data/daily/ 重采样生成 data/weekly/ 周线 K 线。"""
+    codes = sorted(p.stem for p in DAILY_DIR.glob("*.parquet"))
+    logger.info("周线 K 线生成: %d 只", len(codes))
+    t0 = time.time()
+    updated = 0
+    for code in codes:
+        try:
+            df = pd.read_parquet(DAILY_DIR / f"{code}.parquet").sort_values("date")
+            df = df.set_index("date")
+            weekly = df.resample("W").agg({
+                "open": "first", "high": "max",
+                "low": "min", "close": "last",
+                "volume": "sum", "amount": "sum",
+            }).dropna(subset=["open"]).reset_index()
+            weekly["code"] = code
+            weekly = weekly[["date", "open", "high", "low", "close", "volume", "amount", "code"]]
+            weekly.to_parquet(WEEKLY_DIR / f"{code}.parquet", index=False)
+            updated += 1
+        except Exception as e:
+            logger.debug("周线K线 %s: %s", code, str(e)[:60])
+    logger.info("周线 K 线完成: %d/%d 只, %.0fs", updated, len(codes), time.time() - t0)
+
+
+# ================================================================
+#  步骤 ③/③b/③c：识别变化股票 → 重生 CZSC 信号 (init_n=300)
+#  日线/周线/30分钟，各自 4 片 nohup 并行 → 失败回退单线程
 # ================================================================
 
 CHUNK_COUNT = 4
@@ -372,6 +414,7 @@ def _run_serial_signals() -> int:
             sigs = generate_czsc_signals(
                 bars, signals_config=sig_config,
                 sdt="20200101", init_n=min(300, len(bars)), df=True,
+                tqdm_kwargs={"disable": True},
             )
             if sigs is not None and not sigs.empty:
                 sigs = sigs.drop(columns=[c for c in ["freq", "cache"] if c in sigs.columns])
@@ -380,7 +423,7 @@ def _run_serial_signals() -> int:
         except Exception as e:
             logger.debug("%s: %s", code, str(e)[:80])
 
-        if (i + 1) % 500 == 0:
+        if (i + 1) % 200 == 0:
             elapsed = time.time() - t0
             rate = (i + 1) / elapsed
             eta = (total - i - 1) / rate if rate > 0 else 0
@@ -395,6 +438,118 @@ def _run_serial_signals() -> int:
 
 # ================================================================
 # ================================================================
+
+
+# ================================================================
+# ================================================================
+#  步骤 ③b：周线信号重生
+
+def regenerate_weekly_signals():
+    """CZSC 周线信号重生。从 data/weekly/ 读取 K 线，生成到 data/signals_weekly/。"""
+    weekly_codes = sorted(p.stem for p in WEEKLY_DIR.glob("*.parquet"))
+    logger.info("CZSC 周线信号重生: %d 只", len(weekly_codes))
+    if not weekly_codes:
+        logger.warning("周线 K 线为空，跳过周线信号")
+        return 0
+
+    from czsc import RawBar, Freq, generate_czsc_signals
+    from signal_config import get_config
+
+    sig_config = get_config(freq="周线")
+    total = len(weekly_codes)
+    success, t0 = 0, time.time()
+    progress_path = BASE_DIR / "tmp_out" / "signal_weekly_progress.txt"
+
+    for i, code in enumerate(weekly_codes):
+        try:
+            df = pd.read_parquet(WEEKLY_DIR / f"{code}.parquet").sort_values("date")
+            bars = [
+                RawBar(
+                    symbol=code, id=j + 1, dt=r["date"].to_pydatetime(),
+                    freq=Freq.W, open=r["open"], close=r["close"],
+                    high=r["high"], low=r["low"],
+                    vol=r.get("volume", 0), amount=r.get("amount", 0),
+                )
+                for j, (_, r) in enumerate(df.iterrows())
+            ]
+            sigs = generate_czsc_signals(
+                bars, signals_config=sig_config,
+                sdt="20200101", init_n=min(300, len(bars)), df=True,
+                tqdm_kwargs={"disable": True},
+            )
+            if sigs is not None and not sigs.empty:
+                sigs = sigs.drop(columns=[c for c in ["freq", "cache"] if c in sigs.columns])
+                sigs.to_parquet(SIG_WEEKLY_DIR / f"{code}.parquet", index=False)
+                success += 1
+        except Exception as e:
+            logger.debug("周线信号 %s: %s", code, str(e)[:80])
+
+        if (i + 1) % 200 == 0:
+            elapsed = time.time() - t0
+            rate = (i + 1) / elapsed
+            msg = f"[weekly] {i + 1}/{total} 成功{success} {rate:.1f}只/s"
+            progress_path.write_text(msg)
+            logger.info(msg)
+
+    elapsed = time.time() - t0
+    logger.info("周线信号完成: %d/%d 成功, %.0fs", success, total, elapsed)
+    return success
+
+
+# ================================================================
+#  步骤 ③c：30 分钟信号重生
+
+def regenerate_30min_signals():
+    """CZSC 30分钟信号重生。从 data/min30/ 读取 K 线，生成到 data/signals_30min/。"""
+    min30_codes = sorted(p.stem for p in MIN30_DIR.glob("*.parquet"))
+    logger.info("CZSC 30分钟信号重生: %d 只", len(min30_codes))
+    if not min30_codes:
+        logger.warning("30分钟 K 线为空，跳过")
+        return 0
+
+    from czsc import RawBar, Freq, generate_czsc_signals
+    from signal_config import get_config
+
+    sig_config = get_config(freq="30分钟")
+    total = len(min30_codes)
+    success, t0 = 0, time.time()
+    progress_path = BASE_DIR / "tmp_out" / "signal_30min_progress.txt"
+
+    for i, code in enumerate(min30_codes):
+        try:
+            df = pd.read_parquet(MIN30_DIR / f"{code}.parquet").sort_values("date")
+            bars = [
+                RawBar(
+                   symbol=code, id=j + 1, dt=r["date"].to_pydatetime(),
+                   freq=Freq.F30, open=r["open"], close=r["close"],
+                    high=r["high"], low=r["low"],
+                    vol=r.get("volume", 0), amount=r.get("amount", 0),
+                )
+                for j, (_, r) in enumerate(df.iterrows())
+            ]
+            sigs = generate_czsc_signals(
+                bars, signals_config=sig_config,
+                sdt="20200101", init_n=min(300, len(bars)), df=True,
+                tqdm_kwargs={"disable": True},
+            )
+            if sigs is not None and not sigs.empty:
+                sigs = sigs.drop(columns=[c for c in ["freq", "cache"] if c in sigs.columns])
+                sigs.to_parquet(SIG_30MIN_DIR / f"{code}.parquet", index=False)
+                success += 1
+        except Exception as e:
+            logger.debug("30分钟信号 %s: %s", code, str(e)[:80])
+
+        if (i + 1) % 200 == 0:
+            elapsed = time.time() - t0
+            rate = (i + 1) / elapsed
+            msg = f"[30min] {i + 1}/{total} 成功{success} {rate:.1f}只/s"
+            progress_path.write_text(msg)
+            logger.info(msg)
+
+    elapsed = time.time() - t0
+    logger.info("30分钟信号完成: %d/%d 成功, %.0fs", success, total, elapsed)
+    return success
+
 #  步骤 ⑤⑥⑦：L1→L4 流水线
 
 def run_l1_l4():
@@ -440,28 +595,64 @@ def main():
     parser = argparse.ArgumentParser(description="L1 增量更新流水线")
     parser.add_argument("--dry-run", action="store_true", help="仅检查不执行")
     parser.add_argument("--end", type=str, help="截止日期 YYYY-MM-DD")
-    parser.add_argument("--skip-pull", action="store_true", help="跳过日线拉取")
-    parser.add_argument("--skip-signals", action="store_true", help="跳过信号重生")
-    parser.add_argument("--skip-rps", action="store_true", help="跳过 RPS 刷新")
-    parser.add_argument("--skip-l1l4", action="store_true", help="跳过 L1-L4 打分")
+    parser.add_argument("--skip-pull", action="store_true", help="跳过外部 API 拉取 (①+②)")
+    parser.add_argument("--skip-signals", action="store_true", help="跳过信号重生 (③+③b+③c)")
+    parser.add_argument("--skip-weekly", action="store_true", help="跳过周线信号重生 (③b)")
+    parser.add_argument("--skip-weekly-kline", action="store_true", help="仅跳过周线K线生成 (②b)")
+    parser.add_argument("--skip-weekly-signals", action="store_true", help="仅跳过周线CZSC信号 (③b)")
+    parser.add_argument("--skip-30min", action="store_true", help="跳过30分钟信号重生 (③c)")
+    parser.add_argument("--skip-rps", action="store_true", help="跳过 RPS 刷新 (④)")
+    parser.add_argument("--skip-l1l4", action="store_true", help="跳过 L1-L4 打分 (⑤⑥⑦)")
     args = parser.parse_args()
     
     start_ts = time.time()
     
     # Step ① 拉日线 + 上证指数
-    if not args.skip_pull:
+    if not args.skip_pull and not args.dry_run:
         n, end_date = pull_daily(args.end, args.dry_run)
         logger.info("步骤①完成: %d 只更新, 截止 %s", n, end_date.strftime("%Y-%m-%d"))
+    elif args.skip_pull:
+        logger.info("步骤①跳过 (--skip-pull)")
    
     # Step ② 拉 30 分钟数据（与日线同开关）
-    if not args.skip_pull:
+    if not args.skip_pull and not args.dry_run:
         n30 = pull_min30(dry_run=args.dry_run)
         logger.info("步骤②完成: %d 只更新", n30)
+    elif args.skip_pull:
+        logger.info("步骤②跳过 (--skip-pull)")
     
-    # Step ③ CZSC 信号重生
+    # 周线 K 线生成（从日线本地重采样，--skip-pull 时同样执行）
+    if not (args.skip_weekly or args.skip_weekly_kline) and not args.dry_run:
+        generate_weekly_kline()
+    else:
+        logger.info("周线 K 线生成跳过 (%s)",
+                    "--skip-weekly" if args.skip_weekly else "--skip-weekly-kline")
+    
+    # Step ③ CZSC 日线信号重生（使用单线程串行模式，跳过 chunk 并行）
     if not args.skip_signals and not args.dry_run:
-        n_sig = regenerate_signals()
-        logger.info("步骤③完成: %d 只信号", n_sig)
+        n_sig = _run_serial_signals()
+        logger.info("步骤③完成: %d 只日线信号", n_sig)
+    elif args.skip_signals:
+        logger.info("步骤③跳过 (--skip-signals)")
+    
+    # Step ③b CZSC 周线信号重生
+    if not args.skip_signals and not (args.skip_weekly or args.skip_weekly_signals) and not args.dry_run:
+        n_wsig = regenerate_weekly_signals()
+        logger.info("步骤③b完成: %d 只周线信号", n_wsig)
+    elif args.skip_signals:
+        logger.info("步骤③b跳过 (--skip-signals)")
+    else:
+        logger.info("步骤③b跳过 (%s)",
+                    "--skip-weekly" if args.skip_weekly else "--skip-weekly-signals")
+    
+    # Step ③c CZSC 30分钟信号重生
+    if not args.skip_signals and not args.skip_30min and not args.dry_run:
+        n_msig = regenerate_30min_signals()
+        logger.info("步骤③c完成: %d 只30分钟信号", n_msig)
+    elif args.skip_signals:
+        logger.info("步骤③c跳过 (--skip-signals)")
+    elif args.skip_30min:
+        logger.info("步骤③c跳过 (--skip-30min)")
     
     # Step ④ RPS 刷新
     if not args.skip_rps and not args.dry_run:
