@@ -1,86 +1,37 @@
-"""ManualBacktester — L1→L4 管道编排 + 人工标记回测."""
+"""ManualBacktester — L1→L4 管道编排 + 人工标记回测.
+
+复用 zone1_deposition → zone2_regime → zone3_regime → zone4_regime 全漏斗，
+与 l1_update.py / run_zones.py 的数据更新管线完全一致。
+"""
 from pathlib import Path
 
 import pandas as pd
 
-from core.constants import MAX_HOLD_DAYS, COMMISSION, SIGNALS_DIR, BUY_COLS
+from core.constants import MAX_HOLD_DAYS, COMMISSION, SIGNALS_DIR
 from core.data import load_daily, load_signals, get_next_trading_day, get_price_at_date
 from core.signal_detector import detect_all_changes
 from core.structure_cache import load_structure_for_code
-from entry_filter import EntryFilter
-from l3_filter import L3Filter
-from l4_ranker import L4Ranker
 from backtest.exit_engine import ExitEngine
 from manual_backtest.report import export_l4_csv, export_trades_csv
 
-
-_OUT_BASE = Path(__file__).parent.parent / "tmp_out" / "manual_backtest"
-
-# ── regime 检测（复用上证指数 MA20/MA60 排列） ────────────────
-
-_INDEX_CODE = "000001"
-_INDEX_DF = None
-
-
-def _load_index() -> pd.DataFrame:
-    global _INDEX_DF
-    if _INDEX_DF is None:
-        df = load_daily(_INDEX_CODE)
-        if df is None:
-            return pd.DataFrame()
-        df["date"] = pd.to_datetime(df["date"])
-        _INDEX_DF = df.sort_values("date").reset_index(drop=True)
-    return _INDEX_DF
-
-
-def detect_regime(signal_date_str: str) -> str:
-    """基于上证指数 MA20/MA60 多头空头排列判断 regime."""
-    idx = _load_index()
-    if idx.empty:
-        return "CHOP"
-    sig_dt = pd.Timestamp(signal_date_str)
-    window = idx[idx["date"] <= sig_dt].tail(60)
-    if len(window) < 40:
-        return "CHOP"
-    c = window["close"]
-    ma20 = c.rolling(20).mean().iloc[-1]
-    ma60 = c.rolling(60).mean().iloc[-1]
-    if pd.isna(ma60):
-        return "CHOP"
-    if c.iloc[-1] > ma20 > ma60:
-        return "BULL"
-    if c.iloc[-1] < ma20 < ma60:
-        return "BEAR"
-    return "CHOP"
-
-
-# ── 行业名称映射 ────────────────────────────────────────────
-
-_INDUSTRY_MAP_CACHE = None
-
-
-def _get_industry_map() -> pd.DataFrame:
-    global _INDUSTRY_MAP_CACHE
-    if _INDUSTRY_MAP_CACHE is None:
-        p = Path(__file__).parent.parent / "data" / "industry_classification.parquet"
-        if p.exists():
-            _INDUSTRY_MAP_CACHE = pd.read_parquet(p)
-        else:
-            _INDUSTRY_MAP_CACHE = pd.DataFrame(columns=["code", "industry"])
-    return _INDUSTRY_MAP_CACHE
+from zone1_deposition import run as zone1_run
+from zone2_regime import run as zone2_run
+from zone3_regime import run as zone3_run
+from zone4_regime import run as zone4_run
+import regime_detector
+from verify_buy_type import verify_buy_type, check_resonance
 
 
 _OUT_BASE = Path(__file__).parent.parent / "tmp_out" / "manual_backtest"
-
 
 DEFAULT_CONFIG = {}
 
 
 class ManualBacktester:
-    """人工回测编排器 — 截面日期采用最新的信号数据，走全量 zone1-zone4 漏斗。"""
+    """人工回测编排器 — 截面日期采用最新信号数据，走全量 zone1-zone4 漏斗。"""
 
     def __init__(self, config: dict | None = None):
-        _ = config or {}  # 当前无配置项，保留兼容
+        _ = config or {}
         self.l4_df: pd.DataFrame | None = None
         self.marked: pd.DataFrame | None = None
         self.trades_df: pd.DataFrame | None = None
@@ -89,16 +40,13 @@ class ManualBacktester:
     # ── L1→L4 管道 (与 run_zones.py 一致) ──────────────────────
 
     def run_pipeline(self, date: str = "") -> pd.DataFrame:
-        """运行全量 L1→L2→L3→L4 漏斗。
-
-        date 参数用于输出目录命名和 signal_date 列，不影响检测逻辑（zone1 始终基于最新信号数据）。
-        """
+        """运行全量 L1→L2→L3→L4 漏斗。date 仅用于输出目录命名。"""
         if not date:
             date = pd.Timestamp.now().strftime("%Y-%m-%d")
         self._current_date = date
 
-        # ── L1: zone1_deposition ──────────────────────────────
-        print(f"  [L1] zone1_deposition (lookback=20)...", flush=True)
+        # L1
+        print(f"  [L1] zone1_deposition...", flush=True)
         df1 = zone1_run(lookback=20)
         if df1.empty:
             print(f"  [L1] 无候选", flush=True)
@@ -106,7 +54,7 @@ class ManualBacktester:
             return self.l4_df
         print(f"  [L1] {len(df1)} 只", flush=True)
 
-        # ── L1→L2 过渡: regime + B+ ───────────────────────────
+        # Regime + B+
         regime, score, dims = regime_detector.detect()
         print(f"  [Regime] {regime} (BullScore={score:.0f}/100)", flush=True)
 
@@ -121,39 +69,39 @@ class ManualBacktester:
             elif check_resonance(code, bt, signal_date=row.get("最新日期")):
                 bplus_codes.add((code, bt))
                 resonance_count += 1
-        print(f"  [B+] {len(bplus_codes)} 只 (结构{len(bplus_codes)-resonance_count} + 共振{resonance_count})", flush=True)
+        print(f"  [B+] {len(bplus_codes)} 只", flush=True)
 
-        # ── L2: zone2_regime ──────────────────────────────────
+        # L2
         print(f"  [L2] zone2_regime...", flush=True)
         df2 = zone2_run(df1, regime=regime, bplus_codes=bplus_codes)
         print(f"  [L2] {len(df2)} 只", flush=True)
 
-        # ── L3: zone3_regime ──────────────────────────────────
+        # L3
         print(f"  [L3] zone3_regime...", flush=True)
         df3 = zone3_run(df2, regime=regime)
         print(f"  [L3] {len(df3)} 只", flush=True)
 
-        # ── L4: zone4_regime ──────────────────────────────────
+        # L4
         print(f"  [L4] zone4_regime...", flush=True)
         df4 = zone4_run(df3, top_n=9999)
         print(f"  [L4] {len(df4)} 只", flush=True)
 
-        # ── 转换到我们的 L4 格式 ──────────────────────────────
+        # 转换到我们的 L4 格式
         l4 = pd.DataFrame()
         if not df4.empty:
             l4["code"] = df4["代码"].astype(str)
-            l4["buy_type"] = df4.get("买点类型", df4.get("buy_type", "")).astype(str)
+            l4["buy_type"] = df4["买点类型"].astype(str)
             l4["signal_date"] = date
             l4["regime"] = regime
-            l4["composite"] = df4.get("L4_综合得分", df4.get("composite", 0.0))
+            l4["composite"] = df4.get("L4_综合得分", 0.0)
             l4["global_rank"] = range(1, len(l4) + 1)
             l4["zone_rank"] = 0
-            l4["n_l2"] = df4.get("L2_norm", 0.0) if "L2_norm" in df4.columns else 0.0
-            l4["stock_rps"] = df4.get("stock_rps", 0.0) if "stock_rps" in df4.columns else 0.0
-            l4["sector_rps"] = df4.get("sector_rps", 0.0) if "sector_rps" in df4.columns else 0.0
+            l4["n_l2"] = df4.get("L2_归一化", 0.0)
+            l4["stock_rps"] = df4.get("stock_rps", 0.0)
+            l4["sector_rps"] = df4.get("sector_rps", 0.0)
             l4["qlib_score"] = 0.5
-            l4["sector"] = df4.get("行业", df4.get("sector", "")).fillna("").astype(str) if "行业" in df4.columns or "sector" in df4.columns else ""
-            l4["total_score"] = df4.get("L2_综合得分", df4.get("total_score", 0.0))
+            l4["sector"] = df4.get("行业", "").fillna("").astype(str)
+            l4["total_score"] = df4.get("L2_综合得分", 0.0)
             l4["passed"] = True
 
         self.l4_df = l4.reset_index(drop=True)
@@ -184,14 +132,12 @@ class ManualBacktester:
         self.marked = df[df["selected"] == 1].reset_index(drop=True)
         return self.marked
 
-    # ── 回测执行 ────────────────────────────────────────────
-
     def backtest_selected(self) -> pd.DataFrame:
-        """对标记股票逐只回测，返回 trades_df."""
+        """对标记股票逐只回测."""
         if self.marked is None or self.marked.empty:
             raise ValueError("未加载标记数据，请先 load_marked")
         trades = []
-        for _, row in self.marked.iterrows():
+        for i, (_, row) in enumerate(self.marked.iterrows()):
             code = str(row["code"])
             buy_type = str(row.get("buy_type", ""))
             signal_date = str(row.get("signal_date", self._current_date))
@@ -208,7 +154,6 @@ class ManualBacktester:
                 buy_events = [c for c in changes if c["type"] == "buy"]
                 sell_events = [c for c in changes if c["type"] == "sell"]
                 target_d = pd.Timestamp(signal_date).date()
-                # 匹配当日之前的最近买点
                 matched = None
                 bt_keyword = {"一买": "一买", "二买": "二买", "三买": "三买"}.get(buy_type, "一买")
                 for be in reversed(buy_events):
@@ -255,30 +200,27 @@ class ManualBacktester:
                 exit_date = None
                 weighted_ret = None
                 trajectory = []
-                for bar_i in range(len(window)):
-                    bar = window.iloc[bar_i]
+                for bi in range(len(window)):
+                    bar = window.iloc[bi]
                     bar_date = bar["date"]
                     bar_close = bar["close"]
                     bar_high = bar["high"]
-                    result = engine.process_bar(bar_date, bar_close, bar_high,
-                                                sell_exit_target)
+                    result = engine.process_bar(bar_date, bar_close, bar_high, sell_exit_target)
                     if result.exit:
                         exit_price_val = bar_close
                         if result.exit_reason == "卖点":
                             exit_price_val = get_price_at_date(bar_date, daily_sorted) or bar_close
-                        weighted_ret = engine.compute_weighted_return(
-                            entry_price, exit_price_val)
+                        weighted_ret = engine.compute_weighted_return(entry_price, exit_price_val)
                         exit_date = bar_date
                         exit_reason = result.exit_reason
-                        trajectory = result.trajectory if result.trajectory else []
+                        trajectory = result.trajectory or []
                         break
                 if exit_price_val is None:
                     last_bar = window.iloc[-1]
                     exit_date = last_bar["date"]
                     exit_price_val = float(last_bar["open"])
                     exit_reason = "到期"
-                    weighted_ret = engine.compute_weighted_return(
-                        entry_price, exit_price_val)
+                    weighted_ret = engine.compute_weighted_return(entry_price, exit_price_val)
                     trajectory = engine._trajectory if engine.trajectory_log else []
                 if weighted_ret is None or exit_price_val is None:
                     continue
@@ -301,12 +243,12 @@ class ManualBacktester:
                     "trajectory": trajectory,
                 })
             except Exception:
-                continue
+                pass
         self.trades_df = pd.DataFrame(trades)
         return self.trades_df
 
     def backtest_auto_top_n(self, top_n: int = 50) -> pd.DataFrame:
-        """自动 top-N 回测（用于对比基准）."""
+        """自动 top-N 回测（用于对比）."""
         if self.l4_df is None or self.l4_df.empty:
             raise ValueError("L4 数据为空，请先 run_pipeline")
         self.marked = self.l4_df.head(top_n).copy()
