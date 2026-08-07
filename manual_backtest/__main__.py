@@ -11,16 +11,25 @@ from manual_backtest.report import export_trades_csv, print_summary
 _OUT_BASE = Path(__file__).parent.parent / "tmp_out" / "manual_backtest"
 
 
+def _parse_max(args: list) -> int:
+    """从 args 列表中提取 --max N."""
+    for i, a in enumerate(args):
+        if a == '--max' and i + 1 < len(args):
+            return int(args[i + 1])
+    return 0
+
+
 def _usage() -> None:
     print("Usage: python3 -m manual_backtest {date|batch|backtest|analyze} [args...]")
-    print("  date YYYY-MM-DD")
-    print("  batch YYYY-MM-DD YYYY-MM-DD")
+    print("  date YYYY-MM-DD [--max N]")
+    print("  batch YYYY-MM-DD YYYY-MM-DD [--max N]")
     print("  backtest MARKED_CSV [--out OUT]")
     print("  analyze TRADES_CSV [--auto-csv AUTO] [--compare-top N]")
 
 
-def cmd_date(date: str):
-    bt = ManualBacktester()
+def cmd_date(date: str, max_candidates: int = 0):
+    config = {} if max_candidates <= 0 else {"max_candidates": max_candidates}
+    bt = ManualBacktester(config)
     l4 = bt.run_pipeline(date)
     if l4.empty:
         print(f"  {date}: 无候选")
@@ -30,8 +39,9 @@ def cmd_date(date: str):
     print(f"  标记后运行: python3 -m manual_backtest backtest {out}")
 
 
-def cmd_batch(start: str, end: str):
-    bt = ManualBacktester()
+def cmd_batch(start: str, end: str, max_candidates: int = 0):
+    config = {} if max_candidates <= 0 else {"max_candidates": max_candidates}
+    bt = ManualBacktester(config)
     dates = pd.date_range(start, end, freq="B")
     print(f"  {start} -> {end}, {len(dates)} trading days")
     for d in dates:
@@ -87,12 +97,14 @@ def main():
         sys.exit(0)
     if cmd == "date":
         if len(sys.argv) < 3:
-            print("Usage: python3 -m manual_backtest date YYYY-MM-DD"); sys.exit(1)
-        cmd_date(sys.argv[2])
+            print("Usage: python3 -m manual_backtest date YYYY-MM-DD [--max N]"); sys.exit(1)
+        max_n = _parse_max(sys.argv[3:])
+        cmd_date(sys.argv[2], max_n)
     elif cmd == "batch":
         if len(sys.argv) < 4:
-            print("Usage: python3 -m manual_backtest batch START END"); sys.exit(1)
-        cmd_batch(sys.argv[2], sys.argv[3])
+            print("Usage: python3 -m manual_backtest batch START END [--max N]"); sys.exit(1)
+        max_n = _parse_max(sys.argv[4:])
+        cmd_batch(sys.argv[2], sys.argv[3], max_n)
     elif cmd == "backtest":
         if len(sys.argv) < 3:
             print("Usage: python3 -m manual_backtest backtest MARKED_CSV [--out OUT]"); sys.exit(1)

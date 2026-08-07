@@ -77,6 +77,7 @@ DEFAULT_CONFIG = {
     "w_sector_rps": 0.00,
     "w_qlib": 0.25,
     "freshness_days": 99999,
+    "max_candidates": 0,
 }
 
 
@@ -91,6 +92,7 @@ class ManualBacktester:
         self.w_sector_rps = cfg["w_sector_rps"]
         self.w_qlib = cfg["w_qlib"]
         self.freshness_days = cfg["freshness_days"]
+        self.max_candidates = cfg["max_candidates"]
         self.l4_df: pd.DataFrame | None = None
         self.marked: pd.DataFrame | None = None
         self.trades_df: pd.DataFrame | None = None
@@ -125,14 +127,12 @@ class ManualBacktester:
             if mask.sum() == 0:
                 continue
             for idx in mask[mask].index:
-                if idx == 0:
-                    continue
                 for col in buy_cols:
-                    old_v = str(sig_df.at[idx - 1, col])
                     new_v = str(sig_df.at[idx, col])
-                    if old_v == new_v or old_v == "nan":
+                    # 人工回测：截面当天所有活跃买点，不限首次触发日
+                    if new_v in ("", "nan", "None", "0", "其他_任意_任意_0"):
                         continue
-                    if new_v in ("", "nan", "None", "0"):
+                    if "一买" not in new_v and "二买" not in new_v and "三买" not in new_v:
                         continue
                     candidates.append({
                         "code": code,
@@ -145,9 +145,21 @@ class ManualBacktester:
             self.l4_df = pd.DataFrame()
             return self.l4_df
 
+        # 截断候选数 (0 = 不限)
+        if self.max_candidates > 0 and len(candidates) > self.max_candidates:
+            import random
+            random.seed(42)
+            candidates = random.sample(candidates, self.max_candidates)
+            print(f"  [manual_backtest] 候选 {len(candidates)}/{self.max_candidates} (随机采样)", flush=True)
+
         # Step 2: L2 EntryFilter 入场打分
         l2_rows = []
+        total_cand = len(candidates)
+        n_l2 = 0
         for cand in candidates:
+            n_l2 += 1
+            if n_l2 % 50 == 0 or n_l2 == total_cand:
+                print(f"  [L2] {n_l2}/{total_cand}", flush=True)
             code = cand["code"]
             try:
                 daily = load_daily(code)
