@@ -76,6 +76,7 @@ DEFAULT_CONFIG = {
     "w_stock_rps": 0.25,
     "w_sector_rps": 0.00,
     "w_qlib": 0.25,
+    "freshness_days": 99999,
 }
 
 
@@ -89,6 +90,7 @@ class ManualBacktester:
         self.w_stock_rps = cfg["w_stock_rps"]
         self.w_sector_rps = cfg["w_sector_rps"]
         self.w_qlib = cfg["w_qlib"]
+        self.freshness_days = cfg["freshness_days"]
         self.l4_df: pd.DataFrame | None = None
         self.marked: pd.DataFrame | None = None
         self.trades_df: pd.DataFrame | None = None
@@ -173,7 +175,17 @@ class ManualBacktester:
         l2_df = pd.DataFrame(l2_rows)
 
         # Step 3: L3 质量过滤
-        l3_filter = L3Filter(regime)
+        # 人工回测模式：临时覆写 freshness_days 取消信号过期限制
+        import l3_filter as _l3_mod
+        _original = {}
+        for _rk in ["BULL", "BEAR", "CHOP"]:
+            _original[_rk] = _l3_mod.THRESHOLDS[_rk]["freshness_days"]
+            _l3_mod.THRESHOLDS[_rk]["freshness_days"] = self.freshness_days
+        try:
+            l3_filter = L3Filter(regime)
+        finally:
+            for _rk in ["BULL", "BEAR", "CHOP"]:
+                _l3_mod.THRESHOLDS[_rk]["freshness_days"] = _original[_rk]
         l3_df = l3_filter.filter_batch(l2_df)
 
         # Step 4: L4 排名
