@@ -16,6 +16,7 @@ class BarResult:
     exit: bool
     exit_reason: str | None = None
     partial_exits: list = None  # [(pct, price)] for weighted return
+    trajectory: list = None
 
 
 def _load_struct_30m(code):
@@ -36,7 +37,7 @@ class ExitEngine:
       5. 卖点信号：次日开盘价退出
     """
 
-    def __init__(self, code, entry_price, entry_date, buy_type, struct_df):
+    def __init__(self, code, entry_price, entry_date, buy_type, struct_df, trajectory_log: bool = False):
         self.code = code
         self.entry_price = entry_price
         self.entry_date = pd.Timestamp(entry_date)
@@ -56,7 +57,20 @@ class ExitEngine:
         self.position_pct = 1.0
         self._high_since_half_cut = 0.0
         self._partial_exits = []  # [(pct, price)] partial exit records
+        self.trajectory_log = trajectory_log
+        self._trajectory: list[dict] = []
 
+    def _log_trajectory(self, event: str, bar_date, bar_close: float, detail: str = ""):
+        if not self.trajectory_log:
+            return
+        self._trajectory.append({
+            "date": str(pd.Timestamp(bar_date).date()),
+            "event": event,
+            "price": round(bar_close, 2),
+            "defense": round(self.defense, 2) if hasattr(self, "defense") and self.defense else 0,
+            "state": self.state,
+            "detail": detail,
+        })
 
     def _snapshot_entry_structure(self):
         if self.struct_df is None or self.struct_df.empty:
@@ -126,22 +140,30 @@ class ExitEngine:
         fx_on_bar = self._detect_fx(bar_date)
 
         if self.state == "EMPTY":
-            return BarResult(state="EMPTY", position_pct=0.0, exit=False)
+            return BarResult(state="EMPTY", position_pct=0.0, exit=False,
+                             trajectory=list(self._trajectory) if self.trajectory_log else None)
 
         # P1/P2: stateless exit checks
+        old_defense = self.defense
         self.update_defense(bar_date)
+        if self.defense > old_defense:
+            self._log_trajectory("DEFENSE_UP", bar_date, bar_close, detail="止损上移")
 
         if self.defense > 0 and bar_close <= self.defense:
             self.state = "EMPTY"
             self.position_pct = 0.0
+            self._log_trajectory("EXIT", bar_date, bar_close, "结构止损")
             return BarResult(state="EMPTY", position_pct=0.0, exit=True, partial_exits=list(self._partial_exits),
-                           exit_reason="结构止损")
+                             exit_reason="结构止损",
+                             trajectory=list(self._trajectory) if self.trajectory_log else None)
 
         if self.check_v_drop(bar_date, bar_close):
             self.state = "EMPTY"
             self.position_pct = 0.0
+            self._log_trajectory("EXIT", bar_date, bar_close, "V型暴跌穿GG")
             return BarResult(state="EMPTY", position_pct=0.0, exit=True, partial_exits=list(self._partial_exits),
-                           exit_reason="V型暴跌穿GG")
+                             exit_reason="V型暴跌穿GG",
+                             trajectory=list(self._trajectory) if self.trajectory_log else None)
 
         # P3: FULL -> HALF
         if self.state == "FULL":
@@ -153,6 +175,7 @@ class ExitEngine:
                 self.half_cut_day_count = 0
                 self._high_since_half_cut = 0.0
                 self._partial_exits.append((0.5, bar_close))
+                self._log_trajectory("HALF_CUT", bar_date, bar_close, "顶分型+背驰+创新高")
 
         # P4: HALF state
         elif self.state == "HALF":
@@ -167,7 +190,9 @@ class ExitEngine:
                 self.half_cut_day_count = 0
                 self._high_since_half_cut = 0.0
                 self._partial_exits = []
-                return BarResult(state="FULL", position_pct=1.0, exit=False)
+                self._log_trajectory("BUYBACK", bar_date, bar_close)
+                return BarResult(state="FULL", position_pct=1.0, exit=False,
+                                 trajectory=list(self._trajectory) if self.trajectory_log else None)
 
             # Second sell confirmation
             if (self.half_cut_day_count > 1 and
@@ -175,24 +200,31 @@ class ExitEngine:
                     self.check_second_sell(fx_on_bar)):
                 self.state = "EMPTY"
                 self.position_pct = 0.0
+                self._log_trajectory("EXIT", bar_date, bar_close, "二卖确认")
                 return BarResult(state="EMPTY", position_pct=0.0, exit=True, partial_exits=list(self._partial_exits),
-                               exit_reason="二卖确认")
+                                 exit_reason="二卖确认",
+                                 trajectory=list(self._trajectory) if self.trajectory_log else None)
 
             # Timeout
             if self.half_cut_day_count >= HALF_CUT_TIMEOUT:
                 self.state = "EMPTY"
                 self.position_pct = 0.0
+                self._log_trajectory("EXIT", bar_date, bar_close, "半仓超时")
                 return BarResult(state="EMPTY", position_pct=0.0, exit=True, partial_exits=list(self._partial_exits),
-                               exit_reason="半仓超时")
+                                 exit_reason="半仓超时",
+                                 trajectory=list(self._trajectory) if self.trajectory_log else None)
 
         # P5: Sell signal
         if sell_exit_target is not None and bar_date >= sell_exit_target:
             self.state = "EMPTY"
             self.position_pct = 0.0
+            self._log_trajectory("EXIT", bar_date, bar_close, "卖点")
             return BarResult(state="EMPTY", position_pct=0.0, exit=True, partial_exits=list(self._partial_exits),
-                           exit_reason="卖点")
+                             exit_reason="卖点",
+                             trajectory=list(self._trajectory) if self.trajectory_log else None)
 
-        return BarResult(state=self.state, position_pct=self.position_pct, exit=False)
+        return BarResult(state=self.state, position_pct=self.position_pct, exit=False,
+                         trajectory=list(self._trajectory) if self.trajectory_log else None)
 
     def compute_weighted_return(self, entry_price, exit_price):
         """Calculate weighted return accounting for partial exits.
