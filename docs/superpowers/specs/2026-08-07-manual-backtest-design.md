@@ -22,8 +22,9 @@ manual_backtest/
 
 ### 2.1 依赖关系
 
-- 仅调用现有模块的公开接口：`EntryFilter`、`L3Filter`、`L4Ranker`、`ExitEngine`、`detect_all_changes`、`load_daily`、`load_signals`、`load_structure_for_code`、`get_next_trading_day`、`get_price_at_date`
-- 不修改被调用模块的逻辑
+- L1-L4: 直接调用 `zone1_deposition.run()` / `zone2_regime.run()` / `zone3_regime.run()` / `zone4_regime.run()` + `regime_detector.detect()`，与生产管线完全一致
+- 回测: 调用 `ExitEngine`（含 `trajectory_log` 参数）、`detect_all_changes`、`load_daily`、`load_signals`、`load_structure_for_code`
+- 不修改任何被调用模块的逻辑
 - 唯一改动：`ExitEngine.__init__` 加可选 `trajectory_log` 参数（见 4.3 节）
 
 ### 2.2 文件产出
@@ -35,9 +36,8 @@ manual_backtest/
 ```python
 class ManualBacktester:
     """
-    config: dict, 可覆盖以下默认值:
-      - sector_rps_min / w_l2 / w_stock_rps / w_sector_rps / w_qlib (L4Ranker 权重)
-      - freshness_days: int = 99999  (L3 信号新鲜度, 人工回测默认不限)
+    config: dict (当前无配置项, 保留兼容).
+    管线逻辑与 run_zones.py 完全一致, 无需额外参数.
     """
 
     def __init__(self, config: dict | None = None):
@@ -65,18 +65,19 @@ class ManualBacktester:
 
 ### 3.1 run_pipeline 流程
 
+与 `run_zones.py` / `l1_update.py` 的数据更新管线完全一致，复用 zone1-zone4 生产模块：
+
 ```
-1. 加载全量信号文件，detect_all_changes 提取当日所有 buy 事件
-2. 逐只：load_daily + load_signals + regime 检测
-3. EntryFilter.filter → passed + buy_type + total_score
-4. 临时覆写 l3_filter.THRESHOLDS[*]["freshness_days"] 为 config.freshness_days（默认 99999），
-   try/finally 确保调用后恢复原值 → L3Filter.filter 质量过滤
-5. L4Ranker.rank → 排序 + composite + zone_rank
-6. 附加 name/sector 字段（从 industry_classification.parquet）
-7. 返回 l4_df
+1. zone1_deposition.run(lookback=20) → 扫描全市场信号，20天内新触发+当前活跃买点
+2. regime_detector.detect() → 五维牛熊评分，自动判断 BULL/BEAR/CHOP
+3. verify_buy_type + check_resonance → B+ 直通码计算
+4. zone2_regime.run(df1, regime, bplus_codes) → Regime 路由过滤
+5. zone3_regime.run(df2, regime) → 策略二区质量过滤
+6. zone4_regime.run(df3, top_n=9999) → 复合评分排名
+7. 转换为 L4 报告 CSV 格式（code/buy_type/composite/...）
 ```
 
-复用 `smoke_test.py` 中的 `detect_regime()` 和管道逻辑，但不写死 top-N。
+截面日期固定在最新信号数据上（`zone1_deposition` 默认读取最新行），`date` 参数仅用于输出目录命名。
 
 ### 3.2 backtest_selected 流程
 
@@ -207,5 +208,6 @@ python3 -m manual_backtest analyze tmp_out/manual_backtest/2024-03-15/ --compare
 ## 7. 不做
 
 - 暂不做 Web 界面（后续基于 ManualBacktester 类加 FastAPI 端点）
-- 不修改 EntryFilter / L3Filter / L4Ranker 的评分逻辑
+- 不修改 zone1-zone4 及 EntryFilter / L3Filter / L4Ranker 的评分逻辑
 - 不引入新的外部依赖
+- L1-L4 过滤规则与生产管线保持完全一致，不做人工回测专项放宽
