@@ -199,10 +199,10 @@ class ManualBacktester:
             _l3_mod.THRESHOLDS[_rk]["freshness_days"] = self.freshness_days
         try:
             l3_filter = L3Filter(regime)
+            l3_df = l3_filter.filter_batch(l2_df)
         finally:
             for _rk in ["BULL", "BEAR", "CHOP"]:
                 _l3_mod.THRESHOLDS[_rk]["freshness_days"] = _original[_rk]
-        l3_df = l3_filter.filter_batch(l2_df)
 
         # Step 4: L4 排名
         ranker = L4Ranker(
