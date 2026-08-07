@@ -136,6 +136,8 @@ class ManualBacktester:
                         continue
                     if new_v in ("", "nan", "None", "0"):
                         continue
+                    if "一买" not in new_v and "二买" not in new_v and "三买" not in new_v:
+                        continue
                     candidates.append({
                         "code": code,
                         "signal_label": new_v,
