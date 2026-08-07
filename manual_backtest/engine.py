@@ -73,7 +73,15 @@ class ManualBacktester:
 
         # L2
         print(f"  [L2] zone2_regime...", flush=True)
-        df2 = zone2_run(df1, regime=regime, bplus_codes=bplus_codes)
+        # 历史截面适配：临时覆写 pd.Timestamp.now 为截面日期，绕过新鲜度闸门
+        import pandas as _pd
+        _real_now = _pd.Timestamp.now
+        _fake_date = _pd.Timestamp(date)
+        _pd.Timestamp.now = staticmethod(lambda tz=None: _fake_date)
+        try:
+            df2 = zone2_run(df1, regime=regime, bplus_codes=bplus_codes)
+        finally:
+            _pd.Timestamp.now = _real_now
         print(f"  [L2] {len(df2)} 只", flush=True)
 
         # L3
