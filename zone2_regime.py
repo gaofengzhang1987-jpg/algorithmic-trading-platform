@@ -39,8 +39,15 @@ def _check_weekly_resonance(code, signal_dt=None):
     if not wp.exists(): return None
     try:
         w = pd.read_parquet(wp)
+        w_dt = pd.to_datetime(w["dt"])
+        # 新鲜度闸门：周线最后bar距今天 > 7 自然日 → 数据陈旧，跳过共振
+        w_last_dt = w_dt.max()
+        if signal_dt is not None and (pd.Timestamp.now() - w_last_dt).days > 7:
+            logger.debug("weekly stale for %s (last bar %s)", code, w_last_dt.date())
+            _weekly_res_cache[code] = None
+            _weekly_dt_cache[code] = None
+            return None
         if signal_dt is not None:
-            w_dt = pd.to_datetime(w["dt"])
             idx = (w_dt - signal_dt).abs().idxmin()
             last = w.iloc[idx]
         else:
@@ -72,9 +79,18 @@ def _check_30min_resonance(code, signal_dt=None):
     if not mp.exists(): return None
     try:
         m = pd.read_parquet(mp)
+        m_dt = pd.to_datetime(m["dt"])
+        # 新鲜度闸门：30m最后bar距今天 > 3 自然日 → 数据陈旧，跳过共振
+        m_last_dt = m_dt.max()
+        if signal_dt is not None and (pd.Timestamp.now() - m_last_dt).days > 7:
+            logger.debug("30min stale for %s (last bar %s)", code, m_last_dt)
+            _30min_res_cache[code] = None
+            _30min_dt_cache[code] = None
+            return None
         if signal_dt is not None:
-            m_dt = pd.to_datetime(m["dt"])
-            idx = (m_dt - signal_dt).abs().idxmin()
+            # 对齐到信号日 09:30（而非午夜），避免 idxmin 选到前一日 15:00
+            sdt_trading = pd.Timestamp(str(signal_dt.date()) + " 09:30")
+            idx = (m_dt - sdt_trading).abs().idxmin()
             last = m.iloc[idx]
         else:
             last = m.iloc[-1]
@@ -136,7 +152,7 @@ def run(input_df=None, regime="CHOP", bplus_codes=None):
     logger.info("L2 Regime: regime=%s candidates=%d", regime, len(input_df))
 
     results = []
-    rej = {"no_changes": 0, "below_thr": 0, "data_miss": 0, "czsc_err": 0}
+    rej = {"no_changes": 0, "below_thr": 0, "data_miss": 0, "czsc_err": 0, "stale_weekly": 0, "stale_30min": 0}
     passed = 0
 
     for idx, (_, row) in enumerate(input_df.iterrows()):
@@ -174,21 +190,31 @@ def run(input_df=None, regime="CHOP", bplus_codes=None):
 
             # 多级别共振标识：二级(周×日×共振) / 三级联立(周×日×30m×共振)
             # 附加到买点类型标签后面，三级联立直通（加入 bplus_codes）
-            signal_dt = pd.Timestamp(date_str)
-            wtypes = _check_weekly_resonance(code, signal_dt)
-            r30 = _check_30min_resonance(code, signal_dt)
+            # 共振日期对齐到 L1 最新日期，而非 _detect_changes 的变化日
+            l1_date = pd.Timestamp(row["最新日期"])
+            # 信号事件新鲜度：L1 信号日距今 > 10 自然日 → 不参与共振判定
+            if (pd.Timestamp.now() - l1_date).days > 10:
+                rej["stale_signal"] = rej.get("stale_signal", 0) + 1
+                continue
+
+            wtypes = _check_weekly_resonance(code, l1_date)
+            r30 = _check_30min_resonance(code, l1_date)
             resonance_suffix = ""
+            if wtypes is None and code in _weekly_res_cache:
+                rej["stale_weekly"] += 1
+            if r30 is None and code in _30min_res_cache:
+                rej["stale_30min"] += 1
             is_three_level = False
             if wtypes is not None and buy_type in wtypes:
                 # 时间对齐：周线最后bar需在信号日±5交易日内
                 week_ok = True
                 if code in _weekly_dt_cache and _weekly_dt_cache[code] is not None:
-                    week_ok = abs((_weekly_dt_cache[code] - signal_dt).days) <= 5
+                    week_ok = abs((_weekly_dt_cache[code] - l1_date).days) <= 5
                 if r30 is not None and buy_type in r30:
                     # 时间对齐：30m最后bar需在信号日±2交易日内
                     m30_ok = True
                     if code in _30min_dt_cache and _30min_dt_cache[code] is not None:
-                        m30_ok = abs((_30min_dt_cache[code] - signal_dt).days) <= 2
+                        m30_ok = abs((_30min_dt_cache[code] - l1_date).days) <= 2
                     if m30_ok:
                         resonance_suffix = " [周_日_30m_联立]"
                         is_three_level = True
@@ -241,14 +267,14 @@ def run(input_df=None, regime="CHOP", bplus_codes=None):
             passed += 1
 
         if (idx + 1) % 100 == 0:
-            logger.info("  progress: %d/%d (passed:%d no_ch:%d thr:%d)",
+            logger.info("  progress: %d/%d (passed:%d no_ch:%d thr:%d stale_w:%d stale_m:%d)",
                         idx + 1, len(input_df), passed,
-                        rej["no_changes"], rej["below_thr"])
+                        rej["no_changes"], rej["below_thr"], rej["stale_weekly"], rej["stale_30min"])
 
     result_df = pd.DataFrame(results)
     if result_df.empty:
-        logger.info("L2 Regime: %d->0 (no_changes:%d below_thr:%d data_miss:%d czsc:%d)",
-                    len(input_df), *[rej[k] for k in ["no_changes","below_thr","data_miss","czsc_err"]])
+        logger.info("L2 Regime: %d->0 (no_changes:%d below_thr:%d data_miss:%d czsc:%d stale_w:%d stale_m:%d)",
+                    len(input_df), *[rej[k] for k in ["no_changes","below_thr","data_miss","czsc_err","stale_weekly","stale_30min"]])
         return result_df
 
     result_df.sort_values("L2_综合得分", ascending=False, inplace=True)
@@ -257,9 +283,9 @@ def run(input_df=None, regime="CHOP", bplus_codes=None):
 
     out_path = ZONES / "L2_regime.parquet"
     result_df.to_parquet(out_path)
-    logger.info("L2 Regime: %d candidates -> %d passed (no_ch:%d thr:%d miss:%d czsc:%d)",
+    logger.info("L2 Regime: %d candidates -> %d passed (no_ch:%d thr:%d miss:%d czsc:%d stale_w:%d stale_m:%d)",
                 len(input_df), len(result_df),
-                *[rej[k] for k in ["no_changes","below_thr","data_miss","czsc_err"]])
+                *[rej[k] for k in ["no_changes","below_thr","data_miss","czsc_err","stale_weekly","stale_30min"]])
     return result_df
 
 

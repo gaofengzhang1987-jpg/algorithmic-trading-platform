@@ -17,6 +17,9 @@ logger = logging.getLogger("zone3_regime")
 
 BASE = Path(__file__).parent
 ZONES = BASE / "data" / "zones"
+STOCK_RPS = BASE / "data" / "reference" / "stock_rps.parquet"
+INDUSTRY_RPS = BASE / "data" / "reference" / "industry_rps.parquet"
+INDUSTRY_MAP = BASE / "data" / "industry_classification.parquet"
 
 
 def _parse_base_buy_type(label: str) -> str:
@@ -47,6 +50,15 @@ def run(input_df=None, regime="CHOP"):
         "total_score": input_df.get("L2_综合得分", 0),
     })
 
+    # Triple-resonance (三级联立) bypass: skip L3, pass directly
+    _triple_mask = input_df["买点类型"].str.contains("30m_联立", na=False)
+    _triple_df = input_df[_triple_mask].copy()
+    if len(_triple_df) > 0:
+        logger.info("L3: %d triple-resonance stocks bypass L3", len(_triple_df))
+        l2_input = l2_input[~_triple_mask.values]
+    else:
+        _triple_df = pd.DataFrame()
+
     # Run l3_filter
     flt = L3Filter(regime=regime)
     l3_result = flt.filter_batch(l2_input)
@@ -58,11 +70,65 @@ def run(input_df=None, regime="CHOP"):
                 len(input_df), len(passed_df),
                 {k: v for k, v in rej_counts.items()} if rej_counts else "none")
 
+    # Keep triple-resonance stocks even if regular filtering killed everything
+    if passed_df.empty and len(_triple_df) > 0:
+        passed_df = pd.DataFrame({
+            "code": _triple_df["代码"],
+            "buy_type": _triple_df["买点类型"],
+            "passed": True,
+            "reject_reasons": "三级联立豁免",
+            "total_score": _triple_df.get("L2_综合得分", 0),
+        })
+        # Attach RPS
+        try:
+            srps = pd.read_parquet(STOCK_RPS).sort_values("date").groupby("code").last().reset_index()
+            irps = pd.read_parquet(INDUSTRY_RPS).sort_values("date").groupby("industry").last().reset_index()
+            imap = pd.read_parquet(INDUSTRY_MAP).set_index("code")["industry"]
+            _c = passed_df["code"].astype(str).str.zfill(6)
+            _i = _c.map(imap)
+            passed_df["sector_rps"] = _i.map(irps).fillna(0).values
+            passed_df["stock_rps"] = _c.map(srps).fillna(0).values
+        except Exception:
+            passed_df["sector_rps"] = 0
+            passed_df["stock_rps"] = 0
+        logger.info("L3: kept %d triple-resonance stocks (no regular passes)", len(passed_df))
+
     if passed_df.empty:
         return pd.DataFrame()
 
+    # Add back triple-resonance bypass stocks (with RPS lookup)
+    if len(_triple_df) > 0:
+        _triple_passed = pd.DataFrame({
+            "code": _triple_df["代码"],
+            "buy_type": _triple_df["买点类型"],
+            "passed": True,
+            "reject_reasons": "三级联立豁免",
+            "total_score": _triple_df.get("L2_综合得分", 0),
+        })
+        # Attach RPS data for composite scoring in L4
+        if STOCK_RPS.exists() and INDUSTRY_RPS.exists() and INDUSTRY_MAP.exists():
+            try:
+                srps = pd.read_parquet(STOCK_RPS).sort_values("date").groupby("code").last().reset_index()
+                irps = pd.read_parquet(INDUSTRY_RPS).sort_values("date").groupby("industry").last().reset_index()
+                imap = pd.read_parquet(INDUSTRY_MAP)
+                srps = srps.set_index("code")["rps_20d"]
+                irps = irps.set_index("industry")["rps_20d"]
+                imap = imap.set_index("code")["industry"]
+                _codes = _triple_passed["code"].astype(str).str.zfill(6)
+                _industries = _codes.map(imap)
+                _triple_passed["sector_rps"] = _industries.map(irps).fillna(0).values
+                _triple_passed["stock_rps"] = _codes.map(srps).fillna(0).values
+            except Exception:
+                _triple_passed["sector_rps"] = 0
+                _triple_passed["stock_rps"] = 0
+        else:
+            _triple_passed["sector_rps"] = 0
+            _triple_passed["stock_rps"] = 0
+        passed_df = pd.concat([passed_df, _triple_passed], ignore_index=True)
+        logger.info("L3: added back %d triple-resonance stocks", len(_triple_passed))
+
     # Merge L3 filter results back with original L2 fields (exact code+buy_type match)
-    passed_df["_key"] = passed_df["code"] + "|" + passed_df["buy_type"]
+    passed_df["_key"] = passed_df["code"] + "|" + passed_df["buy_type"].apply(_parse_base_buy_type)
     input_df["_key"] = input_df["代码"] + "|" + input_df["买点类型"].apply(_parse_base_buy_type)
     result = input_df[input_df["_key"].isin(passed_df["_key"])].copy()
     result.drop(columns=["_key"], inplace=True)
@@ -70,7 +136,7 @@ def run(input_df=None, regime="CHOP"):
     # Attach L3 filter dimensions
     for col in ["sector_rps", "stock_rps", "atr_pct", "vol_ratio", "high_dist"]:
         if col in passed_df.columns:
-            lookup = passed_df.set_index("code")[col]
+            lookup = passed_df.drop_duplicates(subset=["code"]).set_index("code")[col]
             result[col] = result["代码"].map(lookup)
 
     result.reset_index(drop=True, inplace=True)

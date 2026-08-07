@@ -5,6 +5,9 @@ import json, re, time
 from pathlib import Path
 import pandas as pd
 import numpy as np
+from core.signal_parser import parse_signal
+import logging
+logger = logging.getLogger(__name__)  # L3组合回测
 
 BASE = Path(__file__).parent
 SIG = BASE / "data" / "signals"
@@ -14,12 +17,6 @@ OUT = BASE / "data" / "backtest"
 B1="日线_D1B_BUY1"; S1="日线_D1_三买辅助V230228"; S2="日线_D1#SMA#34_BS3辅助V230319"
 BS2="日线_D1#SMA#21_BS2辅助V230320"; BS3="日线_D1#SMA#34_BS3辅助V230318"
 MC="日线_D1MACD12#26#9_BS1辅助V230313"; M5="日线_D1SMA#5_分类V221101"; M20="日线_D1SMA#20_分类V221101"
-
-
-def _parse(val):
-    if pd.isna(val) or str(val) == "0": return {"v1":"","v2":"","v3":"","score":"0"}
-    parts = str(val).rsplit("_",3)
-    return {"v1":parts[0] if len(parts)>=4 else "","v2":parts[1] if len(parts)>=4 else "","v3":parts[2] if len(parts)>=4 else "","score":parts[3] if len(parts)>=4 else "0"}
 
 
 def compute_full_rule_map(stocks):
@@ -36,14 +33,14 @@ def compute_full_rule_map(stocks):
             dt = str(row["dt"].date()) if hasattr(row["dt"],'date') else ""
 
             # L2-02: 买点类型分级
-            bp1 = _parse(str(sd.iloc[ri][B1]) if B1 in sd.columns else "")
-            bp2 = _parse(str(sd.iloc[ri][BS2]) if BS2 in sd.columns else "")
-            sp  = _parse(str(sd.iloc[ri][S1]) if S1 in sd.columns else "")
-            sp2 = _parse(str(sd.iloc[ri][S2]) if S2 in sd.columns else "")
-            b3p = _parse(str(sd.iloc[ri][BS3]) if BS3 in sd.columns else "")
+            bp1 = parse_signal(str(sd.iloc[ri][B1]) if B1 in sd.columns else "")
+            bp2 = parse_signal(str(sd.iloc[ri][BS2]) if BS2 in sd.columns else "")
+            sp  = parse_signal(str(sd.iloc[ri][S1]) if S1 in sd.columns else "")
+            sp2 = parse_signal(str(sd.iloc[ri][S2]) if S2 in sd.columns else "")
+            b3p = parse_signal(str(sd.iloc[ri][BS3]) if BS3 in sd.columns else "")
             has_ym = "一买" in bp1["v1"]; has_em = "二买" in bp2["v1"]
             has_sm = "三买" in (sp["v1"]+sp2["v1"]+b3p["v1"])
-            macd_p = _parse(str(sd.iloc[ri][MC]) if MC in sd.columns else "")
+            macd_p = parse_signal(str(sd.iloc[ri][MC]) if MC in sd.columns else "")
             macd_golden = "金叉" in macd_p["v2"]
             buytype_ok = has_ym or has_sm or (has_em and macd_golden)
 
@@ -55,7 +52,7 @@ def compute_full_rule_map(stocks):
                 for col in buy_cols:
                     for j in range(1, len(lookback)):
                         o = str(lookback.iloc[j-1][col]); n = str(lookback.iloc[j][col])
-                        if o != n and any(k in _parse(n)["v1"] for k in ["一买","二买","三买"]):
+                        if o != n and any(k in parse_signal(n)["v1"] for k in ["一买","二买","三买"]):
                             fresh_ok = True; break
                     if fresh_ok: break
             else:
@@ -65,7 +62,7 @@ def compute_full_rule_map(stocks):
             stroke_ok = False
             for col in [B1,S1,S2]:
                 if col not in sd.columns: continue
-                p = _parse(str(sd.iloc[ri][col]))
+                p = parse_signal(str(sd.iloc[ri][col]))
                 if ("一买" in p["v1"] or "三买" in p["v1"]) and (m := re.search(r'(\d+)', p["v2"])):
                     if int(m.group(1)) >= 9: stroke_ok = True; break
 
@@ -73,15 +70,15 @@ def compute_full_rule_map(stocks):
             macd_ok = False
             if MC in sd.columns:
                 for j in range(max(0,ri-4), ri+1):
-                    if "金叉" in _parse(str(sd.iloc[j][MC]))["v2"]:
+                    if "金叉" in parse_signal(str(sd.iloc[j][MC]))["v2"]:
                         macd_ok = True; break
 
             # L2-10: MA多头
             ma5_u = ma20_u = False
             if M5 in sd.columns:
-                p=_parse(str(sd.iloc[ri][M5])); ma5_u="多头" in p["v1"] and "向上" in p["v2"]
+                p=parse_signal(str(sd.iloc[ri][M5])); ma5_u="多头" in p["v1"] and "向上" in p["v2"]
             if M20 in sd.columns:
-                p=_parse(str(sd.iloc[ri][M20])); ma20_u="多头" in p["v1"] and "向上" in p["v2"]
+                p=parse_signal(str(sd.iloc[ri][M20])); ma20_u="多头" in p["v1"] and "向上" in p["v2"]
             ma_ok = ma5_u and ma20_u
 
             rule_map[(code, dt)] = {

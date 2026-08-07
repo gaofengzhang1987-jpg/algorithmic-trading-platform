@@ -126,9 +126,17 @@ def run_overlay(l4_df: pd.DataFrame, force_refresh: bool = False) -> pd.DataFram
     l4_df["fundamental_score"] = l4_df["fundamental_score"].fillna(-1)
     l4_df["risk_score"] = l4_df["risk_score"].fillna(-1)
 
+    n_missing_score = (l4_df["fundamental_score"] == -1).sum()
+    n_missing_risk = (l4_df["risk_score"] == -1).sum()
+    if n_missing_score > 0:
+        missing_codes = l4_df[l4_df["fundamental_score"] == -1]["code"].tolist()
+        logger.warning("基本面评分缺失: %d 只 — %s", n_missing_score, ", ".join(missing_codes))
+    if n_missing_risk > 0:
+        missing_risk_codes = l4_df[l4_df["risk_score"] == -1]["code"].tolist()
+        logger.warning("风险检测缺失: %d 只 — %s", n_missing_risk, ", ".join(missing_risk_codes))
     n_risky = (l4_df["risk_score"] >= 5).sum()
     n_safe = (l4_df["risk_score"] <= 1.0).sum()
-    logger.info("基本面完成: %d评分 %d风险检测 — 高危≥5: %d, 安全≤1: %d",
-                len(score_df), len(risk_df), n_risky, n_safe)
+    logger.info("基本面完成: %d评分 %d风险检测 — 缺评分:%d 缺风险:%d 高危≥5:%d 安全≤1:%d",
+                len(score_df), len(risk_df), n_missing_score, n_missing_risk, n_risky, n_safe)
 
     return l4_df

@@ -6,6 +6,8 @@ from pathlib import Path
 import pandas as pd
 from czsc import CZSC, RawBar, Freq
 from czsc.objects import Direction
+import logging
+logger = logging.getLogger(__name__)  # Phase2背离过滤
 
 BASE = Path(__file__).parent
 SIG = BASE / "data" / "signals"

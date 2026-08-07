@@ -1,4 +1,5 @@
 """B+ 结构验证器 + 买点细分标签。
+logger = logging.getLogger(__name__)  # 验证逻辑
 
 verify_buy_type(code, buy_type) -> bool     B+ 验证（原接口不变）
 get_buy_type_tag(code, buy_type) -> str     返回细分标签
@@ -14,6 +15,8 @@ BS2_COL = "日线_D1#SMA#21_BS2辅助V230320"  # 二买信号列
 
 WORKDIR = Path(__file__).resolve().parent
 SIG_DIR = WORKDIR / "data" / "signals"
+SIG_WEEKLY_DIR = WORKDIR / "data" / "signals_weekly"
+SIG_30MIN_DIR = WORKDIR / "data" / "signals_30min"
 STRUCT_DIR = WORKDIR / "data" / "struct_cache"
 DAILY_DIR = WORKDIR / "data" / "daily"
 
@@ -353,9 +356,72 @@ BS2_COL = "日线_D1#SMA#21_BS2辅助V230320"  # 二买信号列
 
 WORKDIR = Path(__file__).resolve().parent
 SIG_DIR = WORKDIR / "data" / "signals"
+SIG_WEEKLY_DIR = WORKDIR / "data" / "signals_weekly"
+SIG_30MIN_DIR = WORKDIR / "data" / "signals_30min"
 STRUCT_DIR = WORKDIR / "data" / "struct_cache"
 DAILY_DIR = WORKDIR / "data" / "daily"
 
 
 # ========== 验证入口（原接口不变）==========
 
+
+# ——— 三级联立共振检测 ———
+
+def check_resonance(code: str, buy_type: str, signal_date=None) -> bool:
+    """三级联立：日线+周线+30min 是否同时存在同一买点类型（严格时间对齐）。
+
+    读取 data/signals_weekly/ 和 data/signals_30min/ 的信号文件，
+    检查末行是否存在与日线相同的买点类型，且满足时间新鲜度。
+    
+    时间对齐规则（与 zone2_regime.py 一致）：
+    - 数据新鲜度：最后 bar 距今天 ≤ 7 自然日
+    - 周线 ↔ 日线：≤ 5 自然日
+    - 30分钟 ↔ 日线：≤ 2 自然日
+    
+    Args:
+        code: 股票代码
+        buy_type: '一买' | '二买' | '三买'
+        signal_date: 日线 L1 信号日期 (pd.Timestamp 或 str)，用于时间对齐。
+                     不传则退化到旧行为（仅检查末行买点类型）。
+    Returns:
+        True 当且仅当周线+30min 末行均有该买点类型信号，且满足时间对齐
+    """
+    import pandas as pd
+    from datetime import datetime
+    
+    freq_map = {
+        "周线":  (SIG_WEEKLY_DIR / f"{code}.parquet", 5),
+        "30分钟": (SIG_30MIN_DIR / f"{code}.parquet", 2),
+    }
+    now = pd.Timestamp.now()
+    if signal_date is not None:
+        signal_date = pd.Timestamp(signal_date)
+    
+    for label, (path, max_day_gap) in freq_map.items():
+        if not path.exists():
+            return False
+        try:
+            df = pd.read_parquet(path)
+            df["dt"] = pd.to_datetime(df["dt"])
+            last_dt = df["dt"].max()
+            
+            # 数据新鲜度：最后 bar 距现在 ≤ 7 自然日
+            if (now - last_dt).days > 7:
+                return False
+            
+            # 时间对齐：找到离信号日最近的 bar，检查日历差
+            if signal_date is not None:
+                idx = (df["dt"] - signal_date).abs().idxmin()
+                aligned_dt = df.loc[idx, "dt"]
+                if abs((aligned_dt - signal_date).days) > max_day_gap:
+                    return False
+                last = df.iloc[idx]
+            else:
+                last = df.iloc[-1]
+            
+            # 买点类型匹配
+            if not any(str(last[col]).startswith(f"{buy_type}_") for col in df.columns):
+                return False
+        except Exception:
+            return False
+    return True

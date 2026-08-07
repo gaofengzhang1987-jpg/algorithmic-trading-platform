@@ -27,6 +27,7 @@ def simulate_trades(
     changes: list[dict],
     struct_df: pd.DataFrame | None = None,
     max_trades: int = 15,
+    weight: float = 1.0,
 ) -> list[dict]:
     """单只股票回测 — 调用方负责传数据。
 
@@ -98,7 +99,6 @@ def simulate_trades(
                 earliest_exit = (bi, result.exit_reason, exit_price, weighted_ret)
                 break
 
-                break
 
         if earliest_exit is not None:
             exit_idx, exit_reason, exit_price_val, weighted_ret = earliest_exit
@@ -129,6 +129,7 @@ def simulate_trades(
             "return_pct": round(net_return * 100, 2),
             "hold_days": hold_days,
             "exit_reason": exit_reason,
+            "weight": weight,
         })
 
     return trades
@@ -166,6 +167,63 @@ def run_all(codes: list[str] | None = None) -> pd.DataFrame:
     logger.info("回测完成: %d 只股票, %d 笔交易", len(set(df["code"])), len(df))
     return df
 
+def run_all_with_weights(
+    code_weights: dict[str, float],
+    signal_date: str | None = None,
+) -> pd.DataFrame:
+    """带权重的全量回测入口 — 对接 PortfolioOptimizer 输出。
+
+    Args:
+        code_weights: {code: weight} 映射（由 PortfolioOptimizer.optimize() 生成）
+        signal_date: 可选信号日期过滤器（只回测该日期附近 ±5 天的信号）
+
+    Returns:
+        DataFrame with per-trade records including weight column.
+    """
+    codes = sorted(code_weights.keys())
+    struct_cache = load_structure_cache()
+    all_trades: list[dict] = []
+
+    for i, code in enumerate(codes):
+        weight = code_weights.get(code, 1.0)
+        try:
+            daily = load_daily(code)
+            if daily is None:
+                continue
+            sig_df = load_signals(code)
+            if sig_df is None:
+                continue
+            changes: list[dict] = detect_all_changes(sig_df)
+            if signal_date:
+                sd = pd.Timestamp(signal_date)
+                changes = [c for c in changes
+                           if abs((pd.Timestamp(c["date"]) - sd).days) <= 5]
+            trades = simulate_trades(
+                code, daily, changes,
+                struct_df=load_structure_for_code(code),
+                weight=weight
+            )
+            all_trades.extend(trades)
+        except Exception as e:
+            logger.warning("%s: 回测失败: %s", code, str(e)[:80])
+        if (i + 1) % 200 == 0:
+            logger.info(
+                "加权回测进度: %d/%d, 累计交易 %d 笔",
+                i + 1, len(codes), len(all_trades)
+            )
+
+    df = pd.DataFrame(all_trades)
+    if df.empty:
+        logger.info("加权回测结果为空")
+        return df
+
+    df.sort_values("entry_date", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    logger.info(
+        "加权回测完成: %d 只股票, %d 笔交易", len(set(df["code"])), len(df)
+    )
+    return df
+
 
 def main():
     import sys
@@ -176,7 +234,7 @@ def main():
     if df.empty:
         print("无交易记录")
         return
-    metrics = compute_metrics(df.to_dict("records"))
+    metrics = compute_metrics(df.to_dict("records"), weighted=True)
     print("=== 回测绩效 ===")
     for k, v in metrics.items():
         print(f"  {k}: {v}")

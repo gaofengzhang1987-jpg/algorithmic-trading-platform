@@ -10,6 +10,8 @@ from core.signal_parser import parse_signal
 from core.signal_detector import detect_all_changes
 from core.metrics import compute_metrics
 from core.constants import SIGNALS_DIR, COMMISSION, CAPITAL_PER_TRADE, MAX_HOLD_DAYS, STOP_LOSS_PCT
+import logging
+logger = logging.getLogger(__name__)  # Phase2回测
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("phase2")

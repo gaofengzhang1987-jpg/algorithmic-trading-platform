@@ -126,7 +126,8 @@ class L3Filter:
             code = row["code"]
             # Stock RPS
             if self._rps_stock is not None and code in self._rps_stock.index:
-                stock_vals.append(float(self._rps_stock.loc[code, "rps_20d"]))
+                val = self._rps_stock.loc[code, "rps_20d"]
+                stock_vals.append(float(val) if pd.notna(val) else 0.0)
             else:
                 stock_vals.append(0.0)
             # Sector RPS (via industry classification)
@@ -178,9 +179,31 @@ class L3Filter:
                     reasons.append("日线趋势不和")
 
         # 3. Weekly trend
-        w_ok = self._check_weekly(dd)
+        w_ok = self._check_weekly(dd, buy_type)
         if not w_ok:
             reasons.append("周线趋势不和")
+
+        # BEAR 专项检查 (2026-07-31 新增)
+        if self.regime == "BEAR":
+            # 4. 5日动量防线
+            if len(dd) >= 6:
+                roc_5d = (last["close"] - dd.iloc[-6]["close"]) / dd.iloc[-6]["close"] * 100
+                if roc_5d < 0:
+                    reasons.append("5日动量不足")
+            # 5. 60日跌幅区间
+            if len(dd) >= 60:
+                high60 = dd["high"].tail(60).max()
+                decline_60d = (last["close"] - high60) / high60 * 100
+                if buy_type == "一买":
+                    if decline_60d > -10 or decline_60d < -50:
+                        reasons.append(f"60日跌幅不合({decline_60d:.0f}%)")
+                elif buy_type == "二买":
+                    if decline_60d > -3 or decline_60d < -30:
+                        reasons.append(f"60日跌幅不合({decline_60d:.0f}%)")
+                elif buy_type == "三买":
+                    if decline_60d > -3 or decline_60d < -40:
+                        reasons.append(f"60日跌幅不合({decline_60d:.0f}%)")
+
 
         # Level 2: Volume / ATR / High distance
         if self.thr.get("level2_enabled", True):
@@ -227,7 +250,7 @@ class L3Filter:
             "total_score": total_score,
         }
 
-    def _check_weekly(self, dd):
+    def _check_weekly(self, dd, buy_type=""):
         """Check weekly trend based on regime."""
         try:
             weekly = (
@@ -252,17 +275,20 @@ class L3Filter:
                 return w_last["close"] > w_last["ma10"] * 0.95
 
             elif trend_type == "slope_up_close>ma10_0.90":
-                if len(weekly) < 5:
+                # BEAR: close > MA10 × 0.90 + 4w斜率 ≥ −2 (2026-07-31更新)
+                if not (w_last["close"] > w_last["ma10"] * 0.90):
+                    return False
+                # 一买豁免斜率检查
+                if "一买" in buy_type:
+                    return True
+                if len(weekly) < 4:
                     return True
                 slope = (
-                    (weekly["ma10"].iloc[-1] - weekly["ma10"].iloc[-5])
-                    / weekly["ma10"].iloc[-5]
+                    (weekly["ma10"].iloc[-1] - weekly["ma10"].iloc[-4])
+                    / weekly["ma10"].iloc[-4]
                     * 100
                 )
-                return (
-                    slope >= 0
-                    and w_last["close"] > w_last["ma10"] * 0.90
-                )
+                return slope >= -2
 
             return True
         except Exception:

@@ -5,6 +5,8 @@ import json, re, time
 from pathlib import Path
 from collections import defaultdict
 import pandas as pd, numpy as np
+import logging
+logger = logging.getLogger(__name__)  # L4网格搜索
 
 BASE = Path(__file__).parent
 SIG = BASE / "data" / "signals"

@@ -8,6 +8,8 @@ import pandas as pd
 from typing import List
 from czsc import CzscStrategyBase
 from czsc.objects import Position, Event, Factor, Operate, Signal
+import logging
+logger = logging.getLogger(__name__)  # 策略
 
 
 class ChanStrategy(CzscStrategyBase):

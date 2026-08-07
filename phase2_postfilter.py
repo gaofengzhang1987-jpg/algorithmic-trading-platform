@@ -4,6 +4,8 @@
 import json, re, time
 from pathlib import Path
 import pandas as pd
+import logging
+logger = logging.getLogger(__name__)  # Phase2后过滤
 
 BASE = Path(__file__).parent
 SIG = BASE / "data" / "signals"

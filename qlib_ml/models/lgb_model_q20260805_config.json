@@ -1,0 +1,17 @@
+{
+  "train_period": [
+    "2020-01-01",
+    "2026-05-01"
+  ],
+  "valid_period": [
+    "2026-05-01",
+    "2026-07-30"
+  ],
+  "horizon": 20,
+  "model_path": "/Users/hz/Desktop/Algorithmic Trading Platform/qlib_ml/models/lgb_model_q20260805.txt",
+  "n_features": 45,
+  "n_samples": 6308028,
+  "corr": -0.078714,
+  "rmse": 0.190826,
+  "created_at": "2026-08-05T23:43:09.699727"
+}

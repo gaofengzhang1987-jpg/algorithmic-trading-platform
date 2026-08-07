@@ -9,8 +9,9 @@ import pandas as pd
 from pathlib import Path
 
 from zone1_deposition import run as l1_run
-from verify_buy_type import verify_buy_type
+from verify_buy_type import verify_buy_type, check_resonance
 from zone2_regime import run as l2_run
+import regime_detector
 from zone3_regime import run as l3_run
 from zone4_regime import run as l4_run
 
@@ -23,27 +24,16 @@ logger = logging.getLogger("run_zones")
 def main():
     t0 = time.time()
 
-    # Auto regime detection（基于上证指数 MA 状态）
-    def _detect_regime():
-        try:
-            idx = pd.read_parquet(Path(__file__).parent / "data" / "index" / "000001.parquet")
-            idx = idx.sort_values("date")
-            if len(idx) < 60: return "CHOP"
-            c = idx["close"].iloc[-1]
-            m20 = idx["close"].rolling(20).mean().iloc[-1]
-            m60 = idx["close"].rolling(60).mean().iloc[-1]
-            if len(idx) >= 26:
-                m20_prev = idx["close"].rolling(20).mean().iloc[-6]
-                s = (m20 - m20_prev) / m20_prev * 100 if m20_prev > 0 else 0
-            else: s = 0
-            if c > m20 > m60 and s > 0: return "BULL"
-            if c < m20 < m60 and s < 0: return "BEAR"
-            return "CHOP"
-        except Exception:
-            return "CHOP"
-
-    regime = sys.argv[2] if len(sys.argv) > 2 else _detect_regime()
-    logger.info("Auto regime: %s (pass sys.argv[2] to override)", regime)
+    # Regime detection（五维牛熊评分制，支持手动覆盖）
+    if len(sys.argv) > 2:
+        regime = sys.argv[2]
+        logger.info("Manual regime: %s (sys.argv override)", regime)
+    else:
+        regime, score, dims = regime_detector.detect()
+        logger.info("Auto regime: %s (Bull Score: %.1f/100)", regime, score)
+        logger.info("  均线:%d/25 位置:%d/25 ADX:%.1f/20 量价:%d/15 协同:%d/15",
+                    dims["均线排列"], dims["价格位置"],
+                    dims["ADX趋势强度"], dims["量价关系"], dims["指数协同"])
     top_n = int(sys.argv[1]) if len(sys.argv) > 1 else 100
 
     # L1: 全量沉淀区（已含拆行 + 标签）
@@ -57,13 +47,18 @@ def main():
 
     # L2: 计算 B+ 通过股票，不设阈值
     bplus_codes = set()
+    resonance_count = 0
     for _, row in df1.iterrows():
         code = row["代码"]
         label = row["买点类型"]
         bt = "一买" if "一买" in label else ("二买" if "二买" in label else "三买")
         if bt != "一买" and verify_buy_type(code, bt):
             bplus_codes.add((code, bt))
-    logger.info("B+ 通过: %d 只 (二买+三买) 不设阈值", len(bplus_codes))
+        elif check_resonance(code, bt, signal_date=row.get("最新日期")):
+            bplus_codes.add((code, bt))
+            resonance_count += 1
+    logger.info("B+ 通过: %d 只 (结构%d + 共振%d)", len(bplus_codes),
+                len(bplus_codes) - resonance_count, resonance_count)
 
     # L2: Regime 路由
     logger.info("=" * 40)

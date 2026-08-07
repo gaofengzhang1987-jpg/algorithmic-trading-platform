@@ -19,6 +19,8 @@ RPS (Relative Price Strength) 计算脚本
 import os, sys, time, glob
 import pandas as pd
 import numpy as np
+import logging
+logger = logging.getLogger(__name__)  # RPS计算
 
 # ─── 配置 ────────────────────────────────────────────────────────────────
 BASE        = os.path.abspath(os.path.dirname(__file__))

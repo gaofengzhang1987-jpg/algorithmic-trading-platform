@@ -50,9 +50,74 @@
 
 ---
 
+## CZSC 信号并行重生规则（2026-07-29 新增）
+
+**原则：Codex 沙箱内 `&` 后台进程会随 `exec_command` 退出被 SIGHUP 清理，`nohup`/`disown` 均无效。**
+
+### 启动方式
+
+- 必须用 `subprocess.Popen` 在**单个 `exec_command`** 内启动 N 个 `signal_chunk.py` 并行
+- 使用 `tmp_out/run_signal_parallel.py` 启动器，默认 **6 核**
+- 禁止 `&` / `nohup` 跨 `exec_command` 后台进程
+
+### 命令
+
+```bash
+python3 tmp_out/run_signal_parallel.py                 # 日线信号, 4 核
+python3 tmp_out/run_signal_parallel.py --workers 4     # 4 核
+python3 tmp_out/run_signal_parallel.py --freq 周线     # 周线信号
+python3 tmp_out/run_signal_parallel.py --dry-run       # 仅预览
+```
+
+### 核数选择
+
+| 核数 | 全量 ~4998 只（全量 bar） | 增量（最后 350 bar） |
+|------|--------------------------|---------------------|
+| 4 (默认) | ~75 分钟 | ~7 分钟 |
+| 6 | ~55 分钟 | ~5 分钟 |
+
+
+### signal_chunk.py 开发规范
+
+1. **`--freq` 参数必支持**：launcher 传入的 `--freq` 必须在 chunk 脚本中声明并映射到正确的数据/信号目录和 `Freq` 枚举。
+
+   ```python
+   FREQ_MAP = {
+       "日线":   {"data": "daily",  "signals": "signals",         "freq": Freq.D,   "min_bars": 120},
+       "周线":   {"data": "weekly", "signals": "signals_weekly",  "freq": Freq.W,   "min_bars": 60},
+       "30分钟": {"data": "min30",  "signals": "signals_30min",   "freq": Freq.F30, "min_bars": 200},
+   }
+   ```
+
+2. **tqdm 必须关闭**：`generate_czsc_signals(..., tqdm_kwargs={"disable": True})`。不关 tqdm 导致 log 膨胀（197KB/chunk/4min → ~16MB 全量）。
+
+3. **进度每 10 只写一次**（不是 100）：每核 ~833 只，100 只一次 = 首个进度点 ~8 分钟，launcher 无法感知进程存活。
+
+   ```python
+   if (i + 1) % 10 == 0 or i == len(my_codes) - 1:
+       progress_file.write_text(msg)
+   ```
+
+4. **启动即写进度**：循环前写 `0/{total} 就绪`，确认进程已进入主循环。
+
+5. **异常必须写 log**：`except Exception as e: print(f"FAIL {code}: {e}", file=sys.stderr, flush=True)`。静默 `failed += 1` 导致全量跑完后无法排查。
+
+### run_signal_parallel.py 开发规范
+
+1. **文件句柄显式管理**：`subprocess.Popen` 的 stdout/stderr 重定向文件必须在退出时 close。
+
+   ```python
+   log_file = open(str(log_path), "w")
+   p = subprocess.Popen(..., stdout=log_file, stderr=subprocess.STDOUT)
+   procs.append((p, log_file))  # 结束后统一 close
+   ```
+
+2. **dry-run 按 `--freq` 查对应目录**：不能硬编码 `data/daily`。
+
+
 ## 设计文件约束（2026-07-24 新增）
 
-以下 4 份设计文件定义管道的决策逻辑，代码变更必须同步更新对应文件：
+以下 5 份设计文件定义管道的决策逻辑与数据更新流程，代码变更必须同步更新对应文件：
 
 | 文件 | 对应代码 |
 |------|----------|
@@ -60,6 +125,7 @@
 | `docs/L2 Regime路由规则.md` | `entry_filter.py`, `zone2_regime.py` |
 | `docs/L3 质量过滤规则.md` | `l3_filter.py`, `zone3_regime.py` |
 | `docs/L4 排名规则.md` | `l4_ranker.py`, `zone4_regime.py` |
+| `docs/全量更新流水线.md` | `l1_update.py`, `tmp_out/run_signal_parallel.py`, `tmp_out/signal_chunk.py` |
 
 ### 同步规则
 
