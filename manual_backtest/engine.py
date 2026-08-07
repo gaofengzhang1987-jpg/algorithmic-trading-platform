@@ -70,165 +70,98 @@ def _get_industry_map() -> pd.DataFrame:
     return _INDUSTRY_MAP_CACHE
 
 
-DEFAULT_CONFIG = {
-    "sector_rps_min": 40.0,
-    "w_l2": 0.50,
-    "w_stock_rps": 0.25,
-    "w_sector_rps": 0.00,
-    "w_qlib": 0.25,
-    "freshness_days": 99999,
-    "max_candidates": 0,
-}
+_OUT_BASE = Path(__file__).parent.parent / "tmp_out" / "manual_backtest"
+
+
+DEFAULT_CONFIG = {}
 
 
 class ManualBacktester:
-    """人工回测编排器 — 截面日期 L1→L4 管道 + 人工标记后逐只回测."""
+    """人工回测编排器 — 截面日期采用最新的信号数据，走全量 zone1-zone4 漏斗。"""
 
     def __init__(self, config: dict | None = None):
-        cfg = {**DEFAULT_CONFIG, **(config or {})}
-        self.sector_rps_min = cfg["sector_rps_min"]
-        self.w_l2 = cfg["w_l2"]
-        self.w_stock_rps = cfg["w_stock_rps"]
-        self.w_sector_rps = cfg["w_sector_rps"]
-        self.w_qlib = cfg["w_qlib"]
-        self.freshness_days = cfg["freshness_days"]
-        self.max_candidates = cfg["max_candidates"]
+        _ = config or {}  # 当前无配置项，保留兼容
         self.l4_df: pd.DataFrame | None = None
         self.marked: pd.DataFrame | None = None
         self.trades_df: pd.DataFrame | None = None
         self._current_date: str = ""
 
-    # ── L1→L4 管道 ──────────────────────────────────────────
+    # ── L1→L4 管道 (与 run_zones.py 一致) ──────────────────────
 
-    def run_pipeline(self, date: str) -> pd.DataFrame:
-        """对指定截面日期运行 L1→L2→L3→L4 完整评分管道."""
+    def run_pipeline(self, date: str = "") -> pd.DataFrame:
+        """运行全量 L1→L2→L3→L4 漏斗。
+
+        date 参数用于输出目录命名和 signal_date 列，不影响检测逻辑（zone1 始终基于最新信号数据）。
+        """
+        if not date:
+            date = pd.Timestamp.now().strftime("%Y-%m-%d")
         self._current_date = date
-        target_date = pd.Timestamp(date).date()
-        regime = detect_regime(date)
 
-        # Step 1: 快速预扫 — 扫描全部信号文件找当日新出现的买点
-        candidates = []
-        files = sorted(SIGNALS_DIR.glob("*.parquet"))
-        if not files:
+        # ── L1: zone1_deposition ──────────────────────────────
+        print(f"  [L1] zone1_deposition (lookback=20)...", flush=True)
+        df1 = zone1_run(lookback=20)
+        if df1.empty:
+            print(f"  [L1] 无候选", flush=True)
             self.l4_df = pd.DataFrame()
             return self.l4_df
-        buy_cols = [c for c in BUY_COLS if c in pd.read_parquet(files[0]).columns]
+        print(f"  [L1] {len(df1)} 只", flush=True)
 
-        for fpath in files:
-            code = fpath.stem
-            try:
-                sig_df = pd.read_parquet(fpath)
-            except Exception:
-                continue
-            if len(sig_df) == 0:
-                continue
-            sig_df["_d"] = pd.to_datetime(sig_df["dt"]).dt.date
-            mask = sig_df["_d"] == target_date
-            if mask.sum() == 0:
-                continue
-            for idx in mask[mask].index:
-                if idx == 0:
-                    continue
-                for col in buy_cols:
-                    old_v = str(sig_df.at[idx - 1, col])
-                    new_v = str(sig_df.at[idx, col])
-                    if old_v == new_v or old_v == "nan":
-                        continue
-                    if new_v in ("", "nan", "None", "0"):
-                        continue
-                    if "一买" not in new_v and "二买" not in new_v and "三买" not in new_v:
-                        continue
-                    candidates.append({
-                        "code": code,
-                        "signal_label": new_v,
-                        "date": str(sig_df.at[idx, "dt"]),
-                    })
-                    break
+        # ── L1→L2 过渡: regime + B+ ───────────────────────────
+        regime, score, dims = regime_detector.detect()
+        print(f"  [Regime] {regime} (BullScore={score:.0f}/100)", flush=True)
 
-        if not candidates:
-            self.l4_df = pd.DataFrame()
-            return self.l4_df
+        bplus_codes = set()
+        resonance_count = 0
+        for _, row in df1.iterrows():
+            code = row["代码"]
+            label = row["买点类型"]
+            bt = "一买" if "一买" in label else ("二买" if "二买" in label else "三买")
+            if bt != "一买" and verify_buy_type(code, bt):
+                bplus_codes.add((code, bt))
+            elif check_resonance(code, bt, signal_date=row.get("最新日期")):
+                bplus_codes.add((code, bt))
+                resonance_count += 1
+        print(f"  [B+] {len(bplus_codes)} 只 (结构{len(bplus_codes)-resonance_count} + 共振{resonance_count})", flush=True)
 
-        # 截断候选数 (0 = 不限)
-        if self.max_candidates > 0 and len(candidates) > self.max_candidates:
-            import random
-            random.seed(42)
-            candidates = random.sample(candidates, self.max_candidates)
-            print(f"  [manual_backtest] 候选 {len(candidates)}/{self.max_candidates} (随机采样)", flush=True)
+        # ── L2: zone2_regime ──────────────────────────────────
+        print(f"  [L2] zone2_regime...", flush=True)
+        df2 = zone2_run(df1, regime=regime, bplus_codes=bplus_codes)
+        print(f"  [L2] {len(df2)} 只", flush=True)
 
-        # Step 2: L2 EntryFilter 入场打分
-        l2_rows = []
-        total_cand = len(candidates)
-        n_l2 = 0
-        for cand in candidates:
-            n_l2 += 1
-            if n_l2 % 50 == 0 or n_l2 == total_cand:
-                print(f"  [L2] {n_l2}/{total_cand}", flush=True)
-            code = cand["code"]
-            try:
-                daily = load_daily(code)
-                sig_df = load_signals(code)
-                if daily is None or sig_df is None:
-                    continue
-                entry_filter = EntryFilter(code, daily, sig_df, regime)
-                result = entry_filter.filter(cand)
-                l2_rows.append({
-                    "code": code,
-                    "buy_type": result.buy_type,
-                    "signal_date": cand["date"],
-                    "total_score": round(result.total_score, 1),
-                    "regime": regime,
-                    "passed": result.passed,
-                    "reject_reason": result.reject_reason,
-                })
-            except Exception:
-                continue
+        # ── L3: zone3_regime ──────────────────────────────────
+        print(f"  [L3] zone3_regime...", flush=True)
+        df3 = zone3_run(df2, regime=regime)
+        print(f"  [L3] {len(df3)} 只", flush=True)
 
-        if not l2_rows:
-            self.l4_df = pd.DataFrame()
-            return self.l4_df
+        # ── L4: zone4_regime ──────────────────────────────────
+        print(f"  [L4] zone4_regime...", flush=True)
+        df4 = zone4_run(df3, top_n=9999)
+        print(f"  [L4] {len(df4)} 只", flush=True)
 
-        l2_df = pd.DataFrame(l2_rows)
+        # ── 转换到我们的 L4 格式 ──────────────────────────────
+        l4 = pd.DataFrame()
+        if not df4.empty:
+            l4["code"] = df4["代码"].astype(str)
+            l4["buy_type"] = df4.get("买点类型", df4.get("buy_type", "")).astype(str)
+            l4["signal_date"] = date
+            l4["regime"] = regime
+            l4["composite"] = df4.get("L4_综合得分", df4.get("composite", 0.0))
+            l4["global_rank"] = range(1, len(l4) + 1)
+            l4["zone_rank"] = 0
+            l4["n_l2"] = df4.get("L2_norm", 0.0) if "L2_norm" in df4.columns else 0.0
+            l4["stock_rps"] = df4.get("stock_rps", 0.0) if "stock_rps" in df4.columns else 0.0
+            l4["sector_rps"] = df4.get("sector_rps", 0.0) if "sector_rps" in df4.columns else 0.0
+            l4["qlib_score"] = 0.5
+            l4["sector"] = df4.get("行业", df4.get("sector", "")).fillna("").astype(str) if "行业" in df4.columns or "sector" in df4.columns else ""
+            l4["total_score"] = df4.get("L2_综合得分", df4.get("total_score", 0.0))
+            l4["passed"] = True
 
-        # Step 3: L3 质量过滤
-        # 人工回测模式：临时覆写 freshness_days 取消信号过期限制
-        import l3_filter as _l3_mod
-        _original = {}
-        for _rk in ["BULL", "BEAR", "CHOP"]:
-            _original[_rk] = _l3_mod.THRESHOLDS[_rk]["freshness_days"]
-            _l3_mod.THRESHOLDS[_rk]["freshness_days"] = self.freshness_days
-        try:
-            l3_filter = L3Filter(regime)
-            l3_df = l3_filter.filter_batch(l2_df)
-        finally:
-            for _rk in ["BULL", "BEAR", "CHOP"]:
-                _l3_mod.THRESHOLDS[_rk]["freshness_days"] = _original[_rk]
-
-        # Step 4: L4 排名
-        ranker = L4Ranker(
-            sector_rps_min=self.sector_rps_min,
-            w_l2=self.w_l2, w_stock_rps=self.w_stock_rps,
-            w_sector_rps=self.w_sector_rps, w_qlib=self.w_qlib,
-        )
-        l4_df = ranker.rank(l3_df)
-
-        # Step 5: 附加行业名称
-        industry_map = _get_industry_map()
-        if not industry_map.empty and "industry" in industry_map.columns:
-            ind_lookup = industry_map.set_index("code")["industry"].to_dict()
-            l4_df["sector"] = l4_df["code"].map(ind_lookup).fillna("")
-        else:
-            l4_df["sector"] = ""
-        l4_df["regime"] = regime
-        l4_df["signal_date"] = date
-
-        self.l4_df = l4_df.reset_index(drop=True)
+        self.l4_df = l4.reset_index(drop=True)
         return self.l4_df
 
     # ── CSV 输出 ────────────────────────────────────────────
 
     def export_for_marking(self, out_dir: str | None = None) -> Path:
-        """导出 L4 报告 CSV，含 selected=0 空列供人工标记."""
         if self.l4_df is None or self.l4_df.empty:
             raise ValueError("L4 数据为空，请先 run_pipeline")
         d = Path(out_dir) if out_dir else _OUT_BASE / self._current_date
