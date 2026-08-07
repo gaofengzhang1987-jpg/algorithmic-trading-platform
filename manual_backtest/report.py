@@ -21,7 +21,8 @@ TRADE_COLUMNS = [
 def export_l4_csv(l4_df: pd.DataFrame, out_path: Path) -> Path:
     """导出 L4 报告 CSV，selected 默认为 0."""
     df = l4_df.copy()
-    df["selected"] = 0
+    if "selected" not in df.columns:
+        df["selected"] = 0
     for col in L4_COLUMNS:
         if col not in df.columns:
             df[col] = ""
