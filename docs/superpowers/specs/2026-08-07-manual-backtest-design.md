@@ -35,7 +35,9 @@ manual_backtest/
 ```python
 class ManualBacktester:
     """
-    config: dict，可覆盖 L4Ranker 默认权重/阈值
+    config: dict, 可覆盖以下默认值:
+      - sector_rps_min / w_l2 / w_stock_rps / w_sector_rps / w_qlib (L4Ranker 权重)
+      - freshness_days: int = 99999  (L3 信号新鲜度, 人工回测默认不限)
     """
 
     def __init__(self, config: dict | None = None):
@@ -53,11 +55,12 @@ class ManualBacktester:
     def backtest_selected(self) -> pd.DataFrame:
         """对标记股票逐只回测，返回 trades_df"""
 
-    def analyze(self) -> dict:
-        """生成分层统计"""
+    def backtest_auto_top_n(self, top_n: int = 50) -> pd.DataFrame:
+        """自动 top-N 回测（用于对比基准）"""
 
-    def compare_with_auto(self, top_n: int = 50) -> pd.DataFrame:
-        """同一截面自动 top-N 对比"""
+    # 统计分析由 ManualAnalyzer 独立处理
+    #   ManualAnalyzer(trades_df, auto_trades_df).analyze() -> dict
+    #   ManualAnalyzer(trades_df, auto_trades_df).compare(top_n) -> pd.DataFrame
 ```
 
 ### 3.1 run_pipeline 流程
@@ -66,7 +69,8 @@ class ManualBacktester:
 1. 加载全量信号文件，detect_all_changes 提取当日所有 buy 事件
 2. 逐只：load_daily + load_signals + regime 检测
 3. EntryFilter.filter → passed + buy_type + total_score
-4. L3Filter.filter → 质量过滤
+4. 临时覆写 l3_filter.THRESHOLDS[*]["freshness_days"] 为 config.freshness_days（默认 99999），
+   try/finally 确保调用后恢复原值 → L3Filter.filter 质量过滤
 5. L4Ranker.rank → 排序 + composite + zone_rank
 6. 附加 name/sector 字段（从 industry_classification.parquet）
 7. 返回 l4_df
@@ -134,6 +138,8 @@ class ManualBacktester:
 ### 4.3 ExitEngine 改动
 
 `ExitEngine.__init__` 新增可选参数 `trajectory_log: bool = False`。
+`BarResult`(实际为 @dataclass, 非 namedtuple) 新增 `trajectory: list | None = None` 字段。
+`trajectory_log=False` 时 `trajectory=None`, 完全向后兼容。
 
 开启后 `process_bar()` 在每次状态变化时追加记录到 `self._trajectory: list[dict]`：
 
