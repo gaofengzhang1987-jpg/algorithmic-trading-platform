@@ -127,12 +127,14 @@ class ManualBacktester:
             if mask.sum() == 0:
                 continue
             for idx in mask[mask].index:
+                if idx == 0:
+                    continue
                 for col in buy_cols:
+                    old_v = str(sig_df.at[idx - 1, col])
                     new_v = str(sig_df.at[idx, col])
-                    # 人工回测：截面当天所有活跃买点，不限首次触发日
-                    if new_v in ("", "nan", "None", "0", "其他_任意_任意_0"):
+                    if old_v == new_v or old_v == "nan":
                         continue
-                    if "一买" not in new_v and "二买" not in new_v and "三买" not in new_v:
+                    if new_v in ("", "nan", "None", "0"):
                         continue
                     candidates.append({
                         "code": code,
