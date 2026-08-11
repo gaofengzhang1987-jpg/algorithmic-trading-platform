@@ -94,7 +94,7 @@ def generate_signals(codes: list, data_dir: Path, sig_dir: Path,
 
 def _patch_paths(bt_data: Path):
     """Monkey-patch 数据目录指向历史回测目录。返回 restore 函数。"""
-    import verify_buy_type, zone1_deposition, zone2_regime, zone3_regime, l3_filter, l3_filter
+    import verify_buy_type, zone1_deposition, zone2_regime, zone3_regime, l3_filter
 
     _orig = {}
     def _p(mod, attr, val):
@@ -121,7 +121,6 @@ def _patch_paths(bt_data: Path):
     _p(zone2_regime, "ZONES", bt_data / "zones")
     if hasattr(zone3_regime, "ZONES"):
         _p(zone3_regime, "ZONES", bt_data / "zones")
-    _p(l3_filter, "DAILY", bt_data / "daily")
     _p(l3_filter, "DAILY", bt_data / "daily")
 
     def restore():
