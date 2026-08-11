@@ -5,7 +5,7 @@
   1. 最近 N 天内状态变化（从非买点 → 买点）
   2. 最新状态已处于买点（即使未在窗口内变化）
 
-输出: data/zones/L1_deposition.parquet
+输出: data/zones/L1_deposition.parquet（按 L1_优先级分 降序，上限 1500）
 """
 
 import logging
@@ -14,6 +14,7 @@ from pathlib import Path
 import pandas as pd
 from verify_buy_type import get_buy_label
 
+MAX_L1 = 1500  # L1 池容量上限
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("zone1")
 
@@ -24,6 +25,58 @@ ZONES_DIR = BASE_DIR / "data" / "zones"
 # 买点信号列的 key 标记
 BUY_KEYS = ["BUY1", "BS2辅助", "BS3辅助", "三买"]
 
+
+# ── L1 优先级分档 ────────────────────────────────────────────
+# 从买点类型后缀推导结构质量（A/B/C 三档），配合信号密度加成排序截断。
+# 一买无后缀，纯信号密度驱动。
+
+_TIER_MAP = {
+    # A 档：B+ 结构验证通过
+    "标准": "A", "浅回踩": "A",
+    # B 档：结构有瑕疵但主体成立
+    "类": "B", "弱突破": "B",
+    # C 档：结构不成立
+    "无基础": "C", "未企稳": "C", "创新低": "C",
+    "回踩进中枢": "C", "跌破中枢": "C", "远离入场区": "C",
+    "无中枢基础": "C",
+}
+_TIER_BASE = {"A": 100, "B": 60, "C": 20}
+
+
+def _classify_tier(label: str) -> str:
+    """从细分标签后缀映射到 A/B/C 档。
+
+    一买无 B+ 验证后缀，固定归 B 档——结构有确认（CZSC 底分型成立）但未做完整验证。
+    """
+    if "一买" in label and "二买" not in label and "三买" not in label:
+        return "B"
+    for suffix, tier in _TIER_MAP.items():
+        if suffix in label:
+            return tier
+    return "C"  # 未匹配的默认 C 档
+
+
+def _compute_l1_priority(label: str, signal_count: int) -> int:
+    """L1 优先级分数：三档基础分 + 信号密度加成，用于排序截断。
+
+    一买固定 B 档（60）+ min(signal_count,10)×5，上限 110。
+    二买/三买按后缀入 A/B/C 档 + min(signal_count,10)×5。
+    """
+    base = _TIER_BASE.get(_classify_tier(label), 20)
+    density_bonus = min(signal_count, 10) * 5
+    return base + density_bonus
+
+
+def _categorize_priority(score: int) -> str:
+    """优先级分数 → 可读分类标签，供排查参考。"""
+    if score >= 100:
+        return "A-高优先级"
+    elif score >= 70:
+        return "B-中等优先级"
+    return "C-低优先级"
+
+
+# ── 信号扫描 ─────────────────────────────────────────────────
 
 def _is_buy_column(col: str) -> bool:
     return any(k in col for k in BUY_KEYS)
@@ -103,14 +156,14 @@ def run(lookback: int = 20) -> pd.DataFrame:
                                 "date": str(recent.iloc[i]["dt"].date()),
                             })
 
-        if not buy_changes:  # 入口②已关闭，仅通过 20 日内状态变化进入 L1
+        if not buy_changes:  # 仅通过 20 日内状态变化进入 L1
             continue
 
-
-        latest_states = {c: str(df.iloc[-1][c]) if not pd.isna(df.iloc[-1][c]) else "" for c in signal_cols}
+        latest_states = {c: str(df.iloc[-1][c]) if not pd.isna(df.iloc[-1][c]) else ""
+                         for c in signal_cols}
         zones = _extract_zones(latest_states, signal_cols)
         if not zones:
-            continue  # 买点信号出现后又消失，最新 bar 无买点
+            continue
 
         state_summary = {}
         for ch in buy_changes:
@@ -122,7 +175,7 @@ def run(lookback: int = 20) -> pd.DataFrame:
             try:
                 label = get_buy_label(code, buy_type=bt)
             except Exception:
-                label = bt  # fallback if struct_cache missing
+                label = bt
             rows.append({
                 "代码": code,
                 "现价": round(last_price, 2),
@@ -137,8 +190,20 @@ def run(lookback: int = 20) -> pd.DataFrame:
         logger.info("L1: 无候选")
         return df
 
-    df.sort_values("信号数", ascending=False, inplace=True)
+    # ── L1 优先级排序 + 截断 ─────────────────────────────────
+    df["L1_优先级分"] = df.apply(
+        lambda r: _compute_l1_priority(r["买点类型"], r["信号数"]), axis=1
+    )
+    df["L1_优先级"] = df["L1_优先级分"].apply(_categorize_priority)
+    df.sort_values("L1_优先级分", ascending=False, inplace=True)
     df.reset_index(drop=True, inplace=True)
+
+    original_count = len(df)
+    if original_count > MAX_L1:
+        cutoff_score = df.iloc[MAX_L1 - 1]["L1_优先级分"]
+        df = df.head(MAX_L1).reset_index(drop=True)
+        logger.info("L1 截断: %d → %d (上限 %d, 截断线分数=%d)",
+                    original_count, MAX_L1, MAX_L1, cutoff_score)
 
     out_path = ZONES_DIR / "L1_deposition.parquet"
     df.to_parquet(out_path)
@@ -150,4 +215,6 @@ if __name__ == "__main__":
     df = run()
     if not df.empty:
         print(f"L1: {len(df)} 只")
-        print(df[["代码", "现价", "买点类型", "信号数"]].head(20).to_string())
+        cols = [c for c in ["代码", "现价", "买点类型", "信号数", "L1_优先级分", "L1_优先级"]
+                if c in df.columns]
+        print(df[cols].head(20).to_string())

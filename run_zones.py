@@ -24,16 +24,25 @@ logger = logging.getLogger("run_zones")
 def main():
     t0 = time.time()
 
+    # 清理旧输出，防止管道中断后残留文件被下游独立脚本误读
+    ZONES = Path(__file__).parent / "data" / "zones"
+    for stale in ["L2_regime.parquet", "L3_regime.parquet", "L4_recommend.parquet"]:
+        sp = ZONES / stale
+        if sp.exists():
+            sp.unlink()
+            logger.info("已清理旧文件: %s", stale)
     # Regime detection（五维牛熊评分制，支持手动覆盖）
+
     if len(sys.argv) > 2:
         regime = sys.argv[2]
         logger.info("Manual regime: %s (sys.argv override)", regime)
     else:
-        regime, score, dims = regime_detector.detect()
+        regime, score, dims, breadth_pct = regime_detector.detect()
         logger.info("Auto regime: %s (Bull Score: %.1f/100)", regime, score)
-        logger.info("  均线:%d/25 位置:%d/25 ADX:%.1f/20 量价:%d/15 协同:%d/15",
+        logger.info("  均线:%d/20 位置:%d/20 ADX:%.1f/20 量价:%d/15 协同:%d/5 宽度:%d/20 (%.1f%%)",
                     dims["均线排列"], dims["价格位置"],
-                    dims["ADX趋势强度"], dims["量价关系"], dims["指数协同"])
+                    dims["ADX趋势强度"], dims["量价关系"], dims["指数协同"],
+                    dims["市场宽度"], breadth_pct)
     top_n = int(sys.argv[1]) if len(sys.argv) > 1 else 100
 
     # L1: 全量沉淀区（已含拆行 + 标签）

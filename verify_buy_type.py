@@ -425,3 +425,10 @@ def check_resonance(code: str, buy_type: str, signal_date=None) -> bool:
         except Exception:
             return False
     return True
+
+
+def check_structural_resonance(code: str, buy_type: str, signal_date=None,
+                               m30_signal_dt=None, weekly_signal_dt=None) -> bool:
+    """三级联立结构共振检查（桩函数，by l3_filter + zone2_regime）。"""
+    # 历史回测环境不使用 struct_cache，始终返回 False
+    return False
