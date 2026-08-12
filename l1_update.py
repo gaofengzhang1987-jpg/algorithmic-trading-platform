@@ -319,6 +319,43 @@ def run_l1_l4():
 #  步骤 ④：RPS 增量刷新
 # ================================================================
 
+def check_signal_coverage():
+    """对比 data/daily/ vs data/signals/，报告缺失信号文件的股票。"""
+    daily_codes = set(p.stem for p in DAILY_DIR.glob("*.parquet"))
+    sig_codes = set(p.stem for p in SIG_DIR.glob("*.parquet"))
+    missing = daily_codes - sig_codes
+    extra = sig_codes - daily_codes
+
+    coverage = len(sig_codes) / len(daily_codes) * 100 if daily_codes else 0
+    logger.info("信号覆盖率检查: %d/%d = %.1f%%, 缺失 %d 只, 异常(有信号无日线) %d 只",
+                len(sig_codes), len(daily_codes), coverage, len(missing), len(extra))
+
+    if missing:
+        import pandas as _pd
+        low_bars = 0; sufficient = 0
+        sufficient_codes = []
+        for code in sorted(missing):
+            try:
+                df = _pd.read_parquet(DAILY_DIR / f"{code}.parquet")
+                if len(df) < MIN_BARS:
+                    low_bars += 1
+                else:
+                    sufficient += 1
+                    sufficient_codes.append(code)
+            except Exception:
+                low_bars += 1
+        logger.warning("缺失 %d 只: bar不足(<%d) %d 只, bar充足但无信号 %d 只",
+                       len(missing), MIN_BARS, low_bars, sufficient)
+        if sufficient > 0:
+            logger.warning("bar充足但无信号的股票(前20): %s",
+                           ", ".join(sorted(sufficient_codes)[:20]))
+
+    if extra:
+        logger.warning("有信号但无日线的异常股票: %s", ", ".join(sorted(extra)[:20]))
+
+    return len(missing), len(extra)
+
+
 def refresh_rps(dry_run=False):
     """RPS 全量刷新 (rps_calc.py full → 重建 close_matrix + daily_close + RPS)。"""
     logger.info("=== RPS 增量刷新 ===")
@@ -450,6 +487,10 @@ def main():
     elif args.skip_signal_train:
         logger.info("步骤③d跳过 (--skip-signal-train)")
 
+    # 信号覆盖率检查
+    if not args.dry_run:
+        check_signal_coverage()
+    
     # Step ④ RPS 刷新
     if not args.skip_rps and not args.dry_run:
         refresh_rps()

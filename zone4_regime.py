@@ -27,7 +27,7 @@ def _parse_base_buy_type(label: str) -> str:
     return "一买"
 
 
-def run(input_df=None, top_n=100):
+def run(input_df=None, top_n=100, skip_fundamental: bool = False):
     if input_df is None:
         p = ZONES / "L3_regime.parquet"
         if not p.exists():
@@ -50,7 +50,7 @@ def run(input_df=None, top_n=100):
     })
 
     # Triple-resonance: boost sector_rps to bypass sector cull, get real composite
-    _triple_mask = input_df["买点类型"].str.contains("30m_联立", na=False).values
+    _triple_mask = input_df["买点类型"].str.contains("30m_结构联立", na=False).values
     _triple_codes = set(l4_input.loc[_triple_mask, "code"])
     if _triple_codes:
         l4_input.loc[_triple_mask, "sector_rps"] = 100.0
@@ -73,7 +73,7 @@ def run(input_df=None, top_n=100):
     # Attach price and original label from L3
     # Sort to prioritize triple-resonance entries for label mapping
     _idf_sorted = input_df.copy()
-    _idf_sorted["_has_triple"] = _idf_sorted["买点类型"].str.contains("30m_联立", na=False)
+    _idf_sorted["_has_triple"] = _idf_sorted["买点类型"].str.contains("30m_结构联立", na=False)
     _idf_sorted = _idf_sorted.sort_values("_has_triple", ascending=False)
     price_map = _idf_sorted.drop_duplicates(subset=["代码"]).set_index("代码")["现价"].to_dict()
     label_map = _idf_sorted.drop_duplicates(subset=["代码"]).set_index("代码")["买点类型"].to_dict()
@@ -124,11 +124,12 @@ def run(input_df=None, top_n=100):
     logger.info("L4 Ranker: %d after dedup", len(ranked))
 
     # 基本面评分叠加（失败不阻断管道）
-    try:
-        from fundamental import run_overlay
-        ranked = run_overlay(ranked)
-    except Exception as e:
-        logger.warning("基本面评分跳过: %s", e)
+    if not skip_fundamental:
+        try:
+            from fundamental import run_overlay
+            ranked = run_overlay(ranked)
+        except Exception as e:
+            logger.warning("基本面评分跳过: %s", e)
 
     out_path = ZONES / "L4_recommend.parquet"
     ranked.to_parquet(out_path)

@@ -19,13 +19,11 @@ from zone2_regime import run as zone2_run
 from zone3_regime import run as zone3_run
 from zone4_regime import run as zone4_run
 import regime_detector
-from verify_buy_type import verify_buy_type, check_resonance, check_structural_resonance
-
+from verify_buy_type import verify_buy_type, check_resonance
 
 _OUT_BASE = Path(__file__).parent.parent / "tmp_out" / "manual_backtest"
 
 DEFAULT_CONFIG = {}
-
 
 class ManualBacktester:
     """人工回测编排器 — 截面日期采用最新信号数据，走全量 zone1-zone4 漏斗。"""
@@ -61,7 +59,6 @@ class ManualBacktester:
         bplus_codes = set()
         bplus_verify_count = 0
         resonance_count = 0
-        structural_count = 0
         for _, row in df1.iterrows():
             code = row["代码"]
             label = row["买点类型"]
@@ -71,13 +68,9 @@ class ManualBacktester:
                 continue
             if verify_buy_type(code, bt):
                 bplus_verify_count += 1  # 加分不豁免
-            if check_structural_resonance(code, bt, signal_date=sig_date,
-                                           m30_signal_dt=None, weekly_signal_dt=None):
-                bplus_codes.add((code, bt))
-                structural_count += 1
-            elif check_resonance(code, bt, signal_date=sig_date):
+            if check_resonance(code, bt, signal_date=sig_date):
                 resonance_count += 1
-        print(f"  [B+] {bplus_verify_count}只(加分) 结构联立{structural_count}只(豁免) 标签共振{resonance_count}只", flush=True)
+        print(f"  [B+] {bplus_verify_count}只(加分) 标签共振{resonance_count}只", flush=True)
 
         # L2
         print(f"  [L2] zone2_regime...", flush=True)

@@ -11,6 +11,7 @@ from pathlib import Path
 import pandas as pd
 
 from entry_filter import EntryFilter, REGIME_THRESHOLDS
+from verify_buy_type import check_structural_resonance, verify_buy_type, check_weekly_structural_resonance
 from zone2_pattern import _detect_changes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -136,7 +137,7 @@ def _determine_buy_type(signal_val):
     return "一买"
 
 
-def run(input_df=None, regime="CHOP", bplus_codes=None):
+def run(input_df=None, regime="CHOP", bplus_codes=None, resonance_bonus_codes=None):
     if input_df is None:
         p = ZONES / "L1_deposition.parquet"
         if not p.exists():
@@ -149,7 +150,9 @@ def run(input_df=None, regime="CHOP", bplus_codes=None):
     global _weekly_res_cache, _30min_res_cache
     _weekly_res_cache = {}
     _30min_res_cache = {}
-    logger.info("L2 Regime: regime=%s candidates=%d", regime, len(input_df))
+    logger.info("L2 Regime: regime=%s candidates=%d (结构联立%d 标签共振%d)", regime, len(input_df),
+                len(bplus_codes) if bplus_codes else 0,
+                len(resonance_bonus_codes) if resonance_bonus_codes else 0)
 
     results = []
     rej = {"no_changes": 0, "below_thr": 0, "data_miss": 0, "czsc_err": 0, "stale_weekly": 0, "stale_30min": 0}
@@ -204,22 +207,52 @@ def run(input_df=None, regime="CHOP", bplus_codes=None):
                 rej["stale_weekly"] += 1
             if r30 is None and code in _30min_res_cache:
                 rej["stale_30min"] += 1
-            is_three_level = False
-            if wtypes is not None and buy_type in wtypes:
-                # 时间对齐：周线最后bar需在信号日±5交易日内
+            is_three_level = False  # 结构联立（豁免权 + L3豁免）
+            is_label_resonance = False  # 标签共振（加分）
+            is_weekly_resonance = False  # 周日共振（豁免 + 加分）
+
+            # --- 结构共振检测（独立于标签匹配） ---
+            try:
+                cross_ok = check_structural_resonance(
+                    code, buy_type, l1_date,
+                    m30_signal_dt=_30min_dt_cache.get(code),
+                    weekly_signal_dt=_weekly_dt_cache.get(code))
+            except Exception:
+                cross_ok = False
+
+            if cross_ok:
+                # 结构对齐：底分型同价区 + 中枢重叠 → 全程豁免
+                resonance_suffix = " [周_日_30m_结构联立]"
+                is_three_level = True
+            elif wtypes is not None and buy_type in wtypes:
+                # 共振判定：周日共振(结构验证) > 标签共振(标签匹配)，优先级互换 2026-08-09
                 week_ok = True
                 if code in _weekly_dt_cache and _weekly_dt_cache[code] is not None:
                     week_ok = abs((_weekly_dt_cache[code] - l1_date).days) <= 5
+                m30_ok = False
                 if r30 is not None and buy_type in r30:
-                    # 时间对齐：30m最后bar需在信号日±2交易日内
                     m30_ok = True
                     if code in _30min_dt_cache and _30min_dt_cache[code] is not None:
                         m30_ok = abs((_30min_dt_cache[code] - l1_date).days) <= 2
-                    if m30_ok:
-                        resonance_suffix = " [周_日_30m_联立]"
-                        is_three_level = True
-                elif week_ok:
-                    resonance_suffix = " [周_日_共振]"
+
+                if week_ok:
+                    # 周日共振优先：日线结构验证 + 周线底分型价格对齐
+                    try:
+                        week_struct_ok = (verify_buy_type(code, buy_type) and
+                                          check_weekly_structural_resonance(code, l1_date))
+                    except Exception:
+                        week_struct_ok = False
+                    if week_struct_ok:
+                        resonance_suffix = " [周_日_共振]"
+                        is_weekly_resonance = True
+                    elif m30_ok:
+                        # 结构验证不通过，30min 有同标签+对齐 → 标签共振降级
+                        resonance_suffix = " [周_日_30m_标签共振]"
+                        is_label_resonance = True
+                elif m30_ok:
+                    # 周线不对齐但 30min 有同标签+对齐 → 标签共振独立路径
+                    resonance_suffix = " [周_日_30m_标签共振]"
+                    is_label_resonance = True
 
             buy_event = {"date": date_str, "signal_label": sig_val, "col": col_name}
 
@@ -228,14 +261,26 @@ def run(input_df=None, regime="CHOP", bplus_codes=None):
             except Exception:
                 rej["czsc_err"] += 1; continue
 
-            # 三级联立加入 bplus 直通（必须在阈值检查之前）
-            if is_three_level and bplus_codes is not None:
-                bplus_codes.add((code, buy_type))
+            # 结构联立 + 周日共振 → L2 阈值豁免（各自独立声明）
+            if bplus_codes is not None:
+                if is_three_level or is_weekly_resonance:
+                    bplus_codes.add((code, buy_type))
 
-            # B+ / 三级联立 通过的买点不设阈值，照常打分但不拦截
+            # L2 得分加成（2026-08-09 分级）：结构联立 15%，周日共振 10%，标签共振/B+ 5%
+            l2_score = result.total_score
+            is_bplus = verify_buy_type(code, buy_type)
+            if is_three_level:
+                l2_score = round(l2_score * 1.15, 1)
+            elif is_weekly_resonance:
+                l2_score = round(l2_score * 1.10, 1)
+            elif is_label_resonance or is_bplus:
+                l2_score = round(l2_score * 1.05, 1)
+
+            # 结构联立 / 周日共振 通过的买点不设阈值
+            # B+ / 标签共振不豁免阈值，未通过则正常淘汰
             if not result.passed:
                 if bplus_codes and (code, buy_type) in bplus_codes:
-                    pass  # B+ / 联立 保留，正常计入
+                    pass  # B+ / 结构联立 保留，正常计入
                 else:
                     rej["below_thr"] += 1; continue
 
@@ -248,7 +293,7 @@ def run(input_df=None, regime="CHOP", bplus_codes=None):
                 "买点类型": buy_type_label,
                 "状态详情": row.get("状态详情", ""),
                 "信号数": row.get("信号数", 0),
-                "L2_综合得分": round(result.total_score, 1),
+                "L2_综合得分": l2_score,
                 "L2_阈值": threshold,
                 "L2_Regime": regime,
                 "L2_维度得分": result.dimension_scores,

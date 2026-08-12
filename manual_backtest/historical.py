@@ -110,6 +110,7 @@ def _patch_paths(bt_data: Path):
     _p(verify_buy_type, "STRUCT_WEEKLY_DIR", bt_data / "struct_cache_weekly")
     _p(verify_buy_type, "DAILY_DIR", bt_data / "daily")
     _p(zone1_deposition, "SIGNALS_DIR", bt_data / "signals")
+    _p(zone1_deposition, "ZONES_DIR", bt_data / "zones")
     _p(zone2_regime, "SIGNALS", bt_data / "signals")
     _p(zone2_regime, "DAILY", bt_data / "daily")
     _p(zone2_regime, "WEEKLY_SIG", bt_data / "signals_weekly")
