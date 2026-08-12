@@ -11,6 +11,7 @@ from pathlib import Path
 import pandas as pd
 
 from entry_filter import EntryFilter, REGIME_THRESHOLDS
+from core.date_utils import get_effective_date
 from verify_buy_type import check_structural_resonance, verify_buy_type, check_weekly_structural_resonance
 from zone2_pattern import _detect_changes
 
@@ -43,7 +44,7 @@ def _check_weekly_resonance(code, signal_dt=None):
         w_dt = pd.to_datetime(w["dt"])
         # 新鲜度闸门：周线最后bar距今天 > 7 自然日 → 数据陈旧，跳过共振
         w_last_dt = w_dt.max()
-        if signal_dt is not None and (pd.Timestamp.now() - w_last_dt).days > 7:
+        if signal_dt is not None and (get_effective_date() - w_last_dt).days > 7:
             logger.debug("weekly stale for %s (last bar %s)", code, w_last_dt.date())
             _weekly_res_cache[code] = None
             _weekly_dt_cache[code] = None
@@ -83,7 +84,7 @@ def _check_30min_resonance(code, signal_dt=None):
         m_dt = pd.to_datetime(m["dt"])
         # 新鲜度闸门：30m最后bar距今天 > 3 自然日 → 数据陈旧，跳过共振
         m_last_dt = m_dt.max()
-        if signal_dt is not None and (pd.Timestamp.now() - m_last_dt).days > 7:
+        if signal_dt is not None and (get_effective_date() - m_last_dt).days > 7:
             logger.debug("30min stale for %s (last bar %s)", code, m_last_dt)
             _30min_res_cache[code] = None
             _30min_dt_cache[code] = None
@@ -155,7 +156,7 @@ def run(input_df=None, regime="CHOP", bplus_codes=None, resonance_bonus_codes=No
                 len(resonance_bonus_codes) if resonance_bonus_codes else 0)
 
     results = []
-    rej = {"no_changes": 0, "below_thr": 0, "data_miss": 0, "czsc_err": 0, "stale_weekly": 0, "stale_30min": 0}
+    rej = {"no_changes": 0, "below_thr": 0, "data_miss": 0, "czsc_err": 0, "stale_signal": 0, "stale_weekly": 0, "stale_30min": 0}
     passed = 0
 
     for idx, (_, row) in enumerate(input_df.iterrows()):
@@ -196,7 +197,7 @@ def run(input_df=None, regime="CHOP", bplus_codes=None, resonance_bonus_codes=No
             # 共振日期对齐到 L1 最新日期，而非 _detect_changes 的变化日
             l1_date = pd.Timestamp(row["最新日期"])
             # 信号事件新鲜度：L1 信号日距今 > 10 自然日 → 不参与共振判定
-            if (pd.Timestamp.now() - l1_date).days > 10:
+            if (get_effective_date() - l1_date).days > 10:
                 rej["stale_signal"] = rej.get("stale_signal", 0) + 1
                 continue
 
@@ -249,11 +250,6 @@ def run(input_df=None, regime="CHOP", bplus_codes=None, resonance_bonus_codes=No
                         # 结构验证不通过，30min 有同标签+对齐 → 标签共振降级
                         resonance_suffix = " [周_日_30m_标签共振]"
                         is_label_resonance = True
-                elif m30_ok:
-                    # 周线不对齐但 30min 有同标签+对齐 → 标签共振独立路径
-                    resonance_suffix = " [周_日_30m_标签共振]"
-                    is_label_resonance = True
-
             buy_event = {"date": date_str, "signal_label": sig_val, "col": col_name}
 
             try:
@@ -312,14 +308,14 @@ def run(input_df=None, regime="CHOP", bplus_codes=None, resonance_bonus_codes=No
             passed += 1
 
         if (idx + 1) % 100 == 0:
-            logger.info("  progress: %d/%d (passed:%d no_ch:%d thr:%d stale_w:%d stale_m:%d)",
+            logger.info("  progress: %d/%d (passed:%d no_ch:%d thr:%d sig:%d stale_w:%d stale_m:%d)",
                         idx + 1, len(input_df), passed,
-                        rej["no_changes"], rej["below_thr"], rej["stale_weekly"], rej["stale_30min"])
+                        rej["no_changes"], rej["below_thr"], rej["stale_signal"], rej["stale_weekly"], rej["stale_30min"])
 
     result_df = pd.DataFrame(results)
     if result_df.empty:
-        logger.info("L2 Regime: %d->0 (no_changes:%d below_thr:%d data_miss:%d czsc:%d stale_w:%d stale_m:%d)",
-                    len(input_df), *[rej[k] for k in ["no_changes","below_thr","data_miss","czsc_err","stale_weekly","stale_30min"]])
+        logger.info("L2 Regime: %d->0 (sig:%d no_ch:%d thr:%d miss:%d czsc:%d stale_w:%d stale_m:%d)",
+                    len(input_df), *[rej[k] for k in ["stale_signal","no_changes","below_thr","data_miss","czsc_err","stale_weekly","stale_30min"]])
         return result_df
 
     result_df.sort_values("L2_综合得分", ascending=False, inplace=True)
@@ -328,9 +324,9 @@ def run(input_df=None, regime="CHOP", bplus_codes=None, resonance_bonus_codes=No
 
     out_path = ZONES / "L2_regime.parquet"
     result_df.to_parquet(out_path)
-    logger.info("L2 Regime: %d candidates -> %d passed (no_ch:%d thr:%d miss:%d czsc:%d stale_w:%d stale_m:%d)",
+    logger.info("L2 Regime: %d candidates -> %d passed (sig:%d no_ch:%d thr:%d miss:%d czsc:%d stale_w:%d stale_m:%d)",
                 len(input_df), len(result_df),
-                *[rej[k] for k in ["no_changes","below_thr","data_miss","czsc_err","stale_weekly","stale_30min"]])
+                *[rej[k] for k in ["stale_signal","no_changes","below_thr","data_miss","czsc_err","stale_weekly","stale_30min"]])
     return result_df
 
 

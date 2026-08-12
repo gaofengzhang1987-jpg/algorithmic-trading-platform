@@ -92,9 +92,15 @@ def generate_signals(codes: list, data_dir: Path, sig_dir: Path,
     return n
 
 
-def _patch_paths(bt_data: Path):
+def _patch_paths(bt_data: Path, cutoff: pd.Timestamp):
     """Monkey-patch 数据目录指向历史回测目录。返回 restore 函数。"""
     import verify_buy_type, zone1_deposition, zone2_regime, zone3_regime, l3_filter
+    import core.date_utils
+    _orig_get_effective = core.date_utils.get_effective_date
+    core.date_utils.get_effective_date = lambda: cutoff
+    # 同时 patch 使用 from-import 的模块本地绑定（Python 不会自动更新）
+    zone2_regime.get_effective_date = lambda: cutoff
+    verify_buy_type.get_effective_date = lambda: cutoff
 
     _orig = {}
     def _p(mod, attr, val):
@@ -125,6 +131,9 @@ def _patch_paths(bt_data: Path):
     _p(l3_filter, "DAILY", bt_data / "daily")
 
     def restore():
+        core.date_utils.get_effective_date = _orig_get_effective
+        zone2_regime.get_effective_date = _orig_get_effective
+        verify_buy_type.get_effective_date = _orig_get_effective
         for (mod, attr), val in _orig.items():
             setattr(mod, attr, val)
     return restore
@@ -137,6 +146,11 @@ def run(date: str, sample: int = 0, workers: int = 4):
 
     # 每次回测前清理旧数据，避免残留文件干扰（幂等设计）
     if bt_dir.exists(): shutil.rmtree(bt_dir)
+    # 同时清理 tmp_out 下上次跑的临时文件（hist_log/prog/cfg），防止 stdout 缓冲时误读旧日志
+    for pattern in ["hist_log_*.log", "hist_prog_*.txt", "hist_cfg_*.json"]:
+        for f in TMP.glob(pattern):
+            try: f.unlink()
+            except OSError: pass
     bt_data.mkdir(parents=True, exist_ok=True)
 
     print(f"=== 历史截面回测: {date} ===\n")
@@ -186,7 +200,7 @@ def run(date: str, sample: int = 0, workers: int = 4):
     print("\n[2c/4] ③c L1 → 周日共振预筛 → 30min CZSC 按需...")
 
     # 先跑 L1 获取候选代码
-    restore_temp = _patch_paths(bt_data)
+    restore_temp = _patch_paths(bt_data, cutoff)
     l1_codes = set()
     try:
         import zone1_deposition
@@ -219,7 +233,7 @@ def run(date: str, sample: int = 0, workers: int = 4):
     # ── Step 4: 全管道 L1→L4 ──
     print("\n[3/4] 全管道 L1→L4...")
 
-    restore = _patch_paths(bt_data)
+    restore = _patch_paths(bt_data, cutoff)
     try:
         from manual_backtest.engine import ManualBacktester
         bt = ManualBacktester()
