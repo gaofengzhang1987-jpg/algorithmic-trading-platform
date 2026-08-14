@@ -230,6 +230,12 @@ def _patch_paths(bt_data: Path, cutoff: pd.Timestamp, historical_regime: str = N
     _p(l3_filter, "INDUSTRY_RPS", bt_data / "reference" / "industry_rps.parquet")
     _p(l3_filter, "INDUSTRY_MAP", bt_data / "reference" / "industry_classification.parquet")
     _p(zone4_regime, "ZONES", bt_data / "zones")
+    try:
+        from qlib_ml import signal_predictor
+        _p(signal_predictor, "DATA_DIR", bt_data / "daily")
+        _p(signal_predictor, "SIGNAL_DIR", bt_data / "signals")
+    except Exception:
+        pass
     _p(exit_engine, "STRUCT_30M_DIR", bt_data / "struct_cache_30m")
 
     # L3Filter 类级 RPS 缓存会绕过路径 patch，这里强制清空，restore 时恢复原值

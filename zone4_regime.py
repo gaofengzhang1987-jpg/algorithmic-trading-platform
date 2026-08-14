@@ -27,7 +27,7 @@ def _parse_base_buy_type(label: str) -> str:
     return "一买"
 
 
-def run(input_df=None, top_n=100, skip_fundamental: bool = False):
+def run(input_df=None, top_n=100, skip_fundamental: bool = False, signal_date: str = None):
     if input_df is None:
         p = ZONES / "L3_regime.parquet"
         if not p.exists():
@@ -64,7 +64,7 @@ def run(input_df=None, top_n=100, skip_fundamental: bool = False):
         except Exception:
             logger.warning("QlibPredictor failed to load, continuing without ML enhancement")
     ranker = L4Ranker(qlib_predictor=qlib_pred)
-    ranked = ranker.rank(l4_input)
+    ranked = ranker.rank(l4_input, signal_date=signal_date)
 
     if ranked.empty:
         logger.info("L4 Ranker: 0 passed after sector cull")

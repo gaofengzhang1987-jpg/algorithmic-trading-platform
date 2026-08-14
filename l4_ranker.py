@@ -22,7 +22,7 @@ class L4Ranker:
         self.w_qlib = w_qlib
         self.qlib_predictor = qlib_predictor
 
-    def rank(self, l3_df):
+    def rank(self, l3_df, signal_date=None):
         """Rank L3 candidates with per-type L2 normalization.
 
         Returns DataFrame grouped by buy_type (三买→二买→一买),
@@ -62,7 +62,9 @@ class L4Ranker:
         # Step 3b: Qlib ML score (if predictor available)
         if self.qlib_predictor is not None and self.w_qlib > 0:
             try:
-                qlib_scores = self.qlib_predictor.score(df["code"].tolist())
+                qlib_scores = self.qlib_predictor.score(
+                    df["code"].tolist(), signal_date=signal_date
+                )
                 df["qlib_score"] = df["code"].map(qlib_scores).fillna(0.5)
                 n_qlib = _norm(df["qlib_score"])
             except Exception:

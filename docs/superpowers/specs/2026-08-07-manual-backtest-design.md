@@ -80,6 +80,9 @@ class ManualBacktester:
 `{bt_dir}/data/reference/`，并 patch `L3Filter` / `zone3_regime` 的
 `STOCK_RPS` / `INDUSTRY_RPS` / `INDUSTRY_MAP` 指向截面快照；
 同时清空 `L3Filter` 类级 RPS 缓存，防止复用当前全量最新值造成未来数据污染。
+`L4Ranker` / `zone4_regime` 的 qlib 打分同样受控：截面日期经
+`signal_date` 传入 `SignalQlibPredictor.score()`，且 `signal_predictor`
+的 `DATA_DIR` / `SIGNAL_DIR` 指向截面目录（2026-08-14 修正）。
 
 ### 3.2 backtest_selected 流程
 

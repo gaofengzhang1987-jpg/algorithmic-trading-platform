@@ -111,7 +111,7 @@ class ManualBacktester:
 
         # L4
         print(f"  [L4] zone4_regime...", flush=True)
-        df4 = zone4_run(df3, top_n=9999, skip_fundamental=True)
+        df4 = zone4_run(df3, top_n=9999, skip_fundamental=True, signal_date=date)
         print(f"  [L4] {len(df4)} 只", flush=True)
 
         # 转换到我们的 L4 格式
