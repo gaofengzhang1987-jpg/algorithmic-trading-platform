@@ -84,6 +84,14 @@ def run(input_df=None, top_n=100, skip_fundamental: bool = False, signal_date: s
     ranked["L2_Regime"] = ranked["code"].map(regime_map)
     ranked["L2_综合得分"] = ranked["total_score"]
 
+    # 透传 L1 标识列（按代码去重，与 买点类型/现价 同一口径）
+    for flag_col in ("非买点转买点", "当天非买转买"):
+        if flag_col in input_df.columns:
+            _flag_map = _idf_sorted.drop_duplicates(subset=["代码"]).set_index("代码")[flag_col].to_dict()
+            ranked[flag_col] = ranked["code"].map(_flag_map).fillna(False).astype(bool)
+        else:
+            ranked[flag_col] = False
+
     # Attach stock name and signal date
     if NAME_DB.exists():
         try:

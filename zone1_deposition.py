@@ -154,6 +154,7 @@ def run(lookback: int = 20) -> pd.DataFrame:
                                 "from": old_v.split("_")[0],
                                 "to": new_v.split("_")[0],
                                 "date": str(recent.iloc[i]["dt"].date()),
+                                "from_is_buy": any(k in old_v for k in ("一买", "二买", "三买")),
                             })
 
         if not buy_changes:  # 仅通过 20 日内状态变化进入 L1
@@ -183,6 +184,15 @@ def run(lookback: int = 20) -> pd.DataFrame:
                 "买点类型": label,
                 "状态详情": " | ".join(f"{k}:{v}" for k, v in list(state_summary.items())[:5]),
                 "信号数": len(buy_changes),
+                "非买点转买点": any(
+                    ch["to"] == bt and not ch["from_is_buy"] for ch in buy_changes
+                ),
+                "当天非买转买": any(
+                    ch["to"] == bt
+                    and ch["date"] == last_date
+                    and not ch["from_is_buy"]
+                    for ch in buy_changes
+                ),
             })
 
     df = pd.DataFrame(rows)

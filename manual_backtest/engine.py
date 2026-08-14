@@ -132,6 +132,14 @@ class ManualBacktester:
             l4["sector"] = df4["行业"].fillna("").astype(str) if "行业" in df4.columns else ""
             l4["total_score"] = df4.get("L2_综合得分", 0.0)
             l4["passed"] = True
+            l4["非买点转买点"] = (
+                df4["非买点转买点"].fillna(False).astype(bool)
+                if "非买点转买点" in df4.columns else False
+            )
+            l4["当天非买转买"] = (
+                df4["当天非买转买"].fillna(False).astype(bool)
+                if "当天非买转买" in df4.columns else False
+            )
 
         # top 100 + 三级联立豁免（2026-08-09）
         if l4 is not None and len(l4) > 0 and 'buy_type' in l4.columns:
@@ -280,6 +288,8 @@ class ManualBacktester:
                     "l4_rank": l4_rank,
                     "composite": round(composite, 4),
                     "regime": regime,
+                    "非买点转买点": str(row.get("非买点转买点", False)).strip().lower() == "true",
+                    "当天非买转买": str(row.get("当天非买转买", False)).strip().lower() == "true",
                     "trajectory": trajectory,
                 })
             except Exception:

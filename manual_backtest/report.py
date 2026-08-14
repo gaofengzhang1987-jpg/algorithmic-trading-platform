@@ -9,12 +9,14 @@ L4_COLUMNS = [
     "selected", "global_rank", "zone_rank", "code", "name", "buy_type",
     "signal_date", "composite", "n_l2", "stock_rps", "sector_rps",
     "qlib_score", "regime", "sector", "total_score", "passed",
+    "非买点转买点", "当天非买转买",
 ]
 
 TRADE_COLUMNS = [
     "code", "buy_type", "signal_date", "entry_date", "exit_date",
     "entry_price", "exit_price", "return_pct", "hold_days",
     "exit_reason", "l4_rank", "composite", "regime", "trajectory_json",
+    "非买点转买点", "当天非买转买",
 ]
 
 

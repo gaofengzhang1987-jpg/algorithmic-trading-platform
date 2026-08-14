@@ -289,6 +289,8 @@ def run(input_df=None, regime="CHOP", bplus_codes=None, resonance_bonus_codes=No
                 "买点类型": buy_type_label,
                 "状态详情": row.get("状态详情", ""),
                 "信号数": row.get("信号数", 0),
+                "非买点转买点": row.get("非买点转买点", False),
+                "当天非买转买": row.get("当天非买转买", False),
                 "L2_综合得分": l2_score,
                 "L2_阈值": threshold,
                 "L2_Regime": regime,
