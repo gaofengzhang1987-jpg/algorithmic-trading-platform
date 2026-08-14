@@ -8,6 +8,7 @@ import json
 from collections import Counter
 import numpy as np
 import pandas as pd
+import requests
 from pathlib import Path
 import logging
 logger = logging.getLogger(__name__)  # 市场状态检测
@@ -21,9 +22,11 @@ BASE_DIR = Path(__file__).parent
 DEFAULT_DAILY = BASE_DIR / "data" / "daily"
 DEFAULT_INDEX = BASE_DIR / "data" / "index"
 BREADTH_CACHE = BASE_DIR / "tmp_out" / "breadth_series.parquet"
+MARKET_AMOUNT_CACHE = BASE_DIR / "tmp_out" / "market_amount.parquet"
 
 
-def detect(data_dir=None, daily_dir=None, state_file=None, force_recompute_breadth=False):
+def detect(data_dir=None, daily_dir=None, state_file=None,
+           force_recompute_breadth=False, force_recompute_market_amount=False):
     """返回 (regime: str, bull_score: float, dim_scores: dict, breadth_pct: float)。
 
     regime ∈ {"BULL", "BEAR", "CHOP"}
@@ -45,17 +48,19 @@ def detect(data_dir=None, daily_dir=None, state_file=None, force_recompute_bread
     last = idx.iloc[-1]
     last2 = idx2.iloc[-1]
 
-    # 读取 000001 日线数据（含成交额），用于绝对成交额参考
+    # 读取 000001 日线数据（_apply_anti_whipsaw 参数兼容）
     daily_dir = Path(daily_dir or DEFAULT_DAILY)
     daily_000001 = _read_daily_000001(daily_dir)
 
     # 市场宽度：全市场 close > MA250 比例
     latest_breadth = _get_latest_breadth(daily_dir, BREADTH_CACHE, force_recompute_breadth)
+    market_amount = _get_market_amount(
+        MARKET_AMOUNT_CACHE, daily_dir, force_recompute_market_amount)
 
     d1 = _score_ma_alignment(last)
     d2 = _score_price_position(last)
     d3 = _score_adx(adx[-1], plus_di[-1], minus_di[-1])
-    d4 = _score_volume_price(idx, daily_000001)
+    d4 = _score_volume_price(idx, market_amount)
     d5 = _score_index_synergy(last, last2)
     d6 = _score_market_breadth(latest_breadth)
 
@@ -83,6 +88,82 @@ def _read_daily_000001(daily_dir):
     if not p.exists():
         return None
     return pd.read_parquet(p).sort_values("date")
+
+
+def _compute_market_amount_series(daily_dir, cache_path):
+    """线上拉取沪市+深市指数成交额，求和写入全市场总成交额缓存（单位元）。
+
+    数据源：腾讯日 K 接口，行情行第 9 个字段为成交额（万元）。
+    沪市用 sh000001，深市用 sz399106（深证综指，覆盖深市全样本）。
+    """
+    symbols = ["sh000001", "sz399106"]
+    cache_path = Path(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    url = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
+    frames = []
+    current_year = pd.Timestamp.now().year
+    for symbol in symbols:
+        rows_all = []
+        for year in range(2019, current_year + 1):
+            params = {
+                "_var": "kline_dayqfq",
+                "param": f"{symbol},day,{year}-01-01,{year + 1}-12-31,640,qfq",
+            }
+            for attempt in range(3):
+                try:
+                    res = requests.get(url, params=params, timeout=20)
+                    text = res.text
+                    payload = json.loads(text[text.find("={") + 1:])
+                    rows = (payload["data"][symbol].get("day")
+                            or payload["data"][symbol].get("qfqday"))
+                    rows_all.extend(rows)
+                    break
+                except Exception:
+                    if attempt == 2:
+                        logger.warning("腾讯成交额拉取失败: %s %s", symbol, year)
+        for row in rows_all:
+            if len(row) < 9 or not row[0] or row[8] is None:
+                continue
+            try:
+                d = pd.Timestamp(row[0]).normalize()
+                amount_yuan = float(row[8]) * 1e4  # 万元 -> 元
+                frames.append({"date": d, "symbol": symbol, "amount": amount_yuan})
+            except Exception:
+                continue
+    df = pd.DataFrame(frames)
+    if df.empty:
+        raise RuntimeError("腾讯成交额拉取失败，无有效数据")
+    # 按年请求会跨年重复返回同一日期，先按 symbol+date 去重再求和
+    df = df.drop_duplicates(subset=["date", "symbol"])
+    out = df.groupby("date", as_index=False)["amount"].sum()
+    out.columns = ["date", "total_amount"]
+    out = out.sort_values("date").reset_index(drop=True)
+    out.to_parquet(cache_path, index=False)
+    logger.info("全市场成交额缓存已重建: %s (%d 天)", cache_path, len(out))
+
+
+def _get_market_amount(cache_path, daily_dir=None, force_recompute=False):
+    """读取全市场日度总成交额缓存；缺失或落后于日线数据时自动重建。"""
+    cache_path = Path(cache_path)
+    need = force_recompute or not cache_path.exists()
+    if not need and daily_dir is not None:
+        try:
+            daily_last = pd.to_datetime(
+                pd.read_parquet(Path(daily_dir) / "000001.parquet",
+                                columns=["date"])["date"]).max()
+            cache_last = pd.to_datetime(
+                pd.read_parquet(cache_path, columns=["date"])["date"]).max()
+            need = cache_last < daily_last
+        except Exception:
+            need = True
+    if need:
+        _compute_market_amount_series(daily_dir or DEFAULT_DAILY, cache_path)
+    try:
+        df = pd.read_parquet(cache_path)
+        df["date"] = pd.to_datetime(df["date"])
+        return df.set_index("date")["total_amount"].astype(float)
+    except Exception:
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -200,11 +281,11 @@ def _score_adx(adx, plus_di, minus_di):
 # 维度四：量价关系（15 分）
 # ═══════════════════════════════════════════════════════════════
 
-def _score_volume_price(df, daily_000001=None):
-    """量价关系评分：相对量比 + 5 日涨跌 + 绝对成交额参考。
+def _score_volume_price(df, market_amount=None):
+    """量价关系评分：相对量比 + 5 日涨跌 + 全市场绝对成交额参考。
 
-    daily_000001: 000001 日线 DataFrame（含 amount 列，单位万元），用于绝对成交额判断。
-    注意：000001 单只成交额是两市合计的代理变量，非精确全市场值。
+    market_amount: 全市场日度总成交额 Series（date 索引，单位元），用于流动性判断。
+    阈值按两市日成交额标定：充裕 > 1.5 万亿，极度萎缩 < 6000 亿。
     """
     vol = df["volume"].values
     close = df["close"].values
@@ -229,21 +310,27 @@ def _score_volume_price(df, daily_000001=None):
     else:
         base = 8
 
-    # ── 绝对成交额参考（000001 日成交额，万元） ──
-    # 000001 典型日成交额：牛市 200-400 亿，熊市 50-100 亿
-    # 阈值：近 5 日均量 > 200 亿(2000000 万元)为流动性充裕，< 50 亿(500000 万元)为极度萎缩
-    if daily_000001 is not None and "amount" in daily_000001.columns and len(daily_000001) >= 21:
-        amounts = daily_000001["amount"].values[-21:]
-        avg_5_amount = np.nanmean(amounts[-5:])
-        avg_20_amount = np.nanmean(amounts[:-1])
-        if not np.isnan(avg_5_amount) and not np.isnan(avg_20_amount):
-            amount_ratio = avg_5_amount / avg_20_amount if avg_20_amount > 0 else 1.0
-            # 放量上涨 + 绝对成交额充裕 → +2 信心加分
-            if vol_ratio > 1.05 and pct_5 > 0 and avg_5_amount > 2000000 and amount_ratio > 1.0:
-                base = min(15, base + 2)
-            # 成交额极度萎缩（无论量比如何）→ -2
-            elif avg_5_amount < 500000:
-                base = max(0, base - 2)
+    # ── 全市场绝对成交额参考（元） ──
+    # 两市日成交额：牛市常见 1-3 万亿，熊市常见 5000-8000 亿
+    # 阈值：近 5 日均量 > 1.5 万亿为流动性充裕，< 6000 亿为极度萎缩
+    if market_amount is not None and len(market_amount) >= 21:
+        dates = pd.to_datetime(df["date"])
+        amounts = market_amount.reindex(dates).astype(float)
+        valid = amounts.dropna()
+        # 最后一天无全市场成交额（数据未更新）时跳过，避免尾部缺失误判
+        if len(valid) >= 21 and valid.index[-1] == dates.iloc[-1]:
+            tail = valid.tail(21)
+            avg_5_amount = float(tail.tail(5).mean())
+            avg_20_amount = float(tail.iloc[:-1].mean())
+            # 全市场成交额 < 500 亿视为日线数据未完整更新，跳过绝对额调整
+            if avg_20_amount > 0 and avg_5_amount >= 5e10:
+                amount_ratio = avg_5_amount / avg_20_amount
+                # 放量上涨 + 流动性充裕 → +2 信心加分
+                if vol_ratio > 1.05 and pct_5 > 0 and avg_5_amount > 1.5e12 and amount_ratio > 1.0:
+                    base = min(15, base + 2)
+                # 成交额极度萎缩（无论量比如何）→ -2
+                elif avg_5_amount < 6e11:
+                    base = max(0, base - 2)
 
     return base
 
@@ -451,7 +538,10 @@ def _apply_anti_whipsaw(today_score, idx, idx2, state_path,
         if len(set(regimes)) == 1:
             # CZSC 结构确认：BULL/BEAR 切换时验证中枢+背驰+分型
             old_regime = state.get("regime", "CHOP")
-            if regimes[0] != old_regime and regimes[0] in ("BULL", "BEAR"):
+            if regimes[0] == "CHOP":
+                # CHOP 免检，允许从 BULL/BEAR 切回震荡
+                state["regime"] = "CHOP"
+            elif regimes[0] != old_regime and regimes[0] in ("BULL", "BEAR"):
                 confirmed, reason = _confirm_regime_change(regimes[0], daily_000001, idx)
                 if not confirmed:
                     logger.warning("[%s_REJECT] %s — 保持 %s", regimes[0], reason, old_regime)
@@ -638,16 +728,16 @@ def _confirm_regime_change(new_regime, daily_000001, idx):
     if new_regime not in ("BULL", "BEAR"):
         return (True, "CHOP 免检")
 
-    if daily_000001 is None or len(daily_000001) < 300:
-        return (True, f"日线数据不足({len(daily_000001) if daily_000001 is not None else 0}bar)，跳过结构确认")
+    if idx is None or len(idx) < 300:
+        return (True, f"日线数据不足({len(idx) if idx is not None else 0}bar)，跳过结构确认")
 
     try:
         from czsc import CZSC, RawBar, Freq
-        df = daily_000001.sort_values("date").reset_index(drop=True)
+        df = idx.sort_values("date").reset_index(drop=True)
         bars = [RawBar(symbol="000001", id=j + 1, dt=r["date"].to_pydatetime(),
                        freq=Freq.D, open=r["open"], close=r["close"],
                        high=r["high"], low=r["low"],
-                       vol=r.get("volume", 0), amount=r.get("amount", 0))
+                       vol=r.get("volume", 0), amount=0)
                 for j, (_, r) in enumerate(df.iterrows())]
         czsc = CZSC(bars, max_bi_num=50)
     except Exception as e:

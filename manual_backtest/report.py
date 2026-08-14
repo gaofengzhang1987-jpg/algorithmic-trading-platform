@@ -25,6 +25,8 @@ def export_l4_csv(l4_df: pd.DataFrame, out_path: Path) -> Path:
     df = l4_df.copy()
     if "selected" not in df.columns:
         df["selected"] = 0
+    if "code" in df.columns:
+        df["code"] = df["code"].astype(str).str.zfill(6)
     for col in L4_COLUMNS:
         if col not in df.columns:
             df[col] = ""
@@ -35,6 +37,8 @@ def export_l4_csv(l4_df: pd.DataFrame, out_path: Path) -> Path:
 def export_trades_csv(trades_df: pd.DataFrame, out_path: Path) -> Path:
     """导出回测结果 CSV，trajectory 序列化为 JSON 字符串."""
     df = trades_df.copy()
+    if "code" in df.columns:
+        df["code"] = df["code"].astype(str).str.zfill(6)
     if "trajectory" in df.columns:
         df["trajectory_json"] = df["trajectory"].apply(
             lambda t: json.dumps(t, ensure_ascii=False) if isinstance(t, list) else ""

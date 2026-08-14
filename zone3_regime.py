@@ -51,7 +51,7 @@ def run(input_df=None, regime="CHOP"):
     })
 
     # Triple-resonance (三级联立) bypass: skip L3, pass directly
-    _triple_mask = input_df["买点类型"].str.contains("30m_联立", na=False)
+    _triple_mask = input_df["买点类型"].str.contains("30m_结构联立", na=False)
     _triple_df = input_df[_triple_mask].copy()
     if len(_triple_df) > 0:
         logger.info("L3: %d triple-resonance stocks bypass L3", len(_triple_df))

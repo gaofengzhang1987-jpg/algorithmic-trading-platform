@@ -102,12 +102,20 @@ def compute_rps_single(mat, periods=None):
     sub_dates = mat.index.intersection(periods) if periods is not None else mat.index
     print(f"  序列化 {len(sub_dates)} 天数据..."); sys.stdout.flush()
     t1 = tic()
-    base = mat.loc[sub_dates].stack().reset_index()
-    base.columns = ['date', 'code', 'close']
+    # 以 250d RPS（最严格，行数最少）为基准建表，其他周期通过 join 合并
+    stacked = rps_dict[250].loc[sub_dates].stack()
+    base = stacked.reset_index()
+    base.columns = ['date', 'code', 'rps_250d']
+    close_s = mat.loc[sub_dates].stack().rename('close')
+    base = base.join(close_s, on=['date', 'code'])
+    for p in [20, 60, 120]:
+        s = rps_dict[p].loc[sub_dates].stack().rename(f'rps_{p}d')
+        base = base.join(s, on=['date', 'code'])
     for p in PERIODS:
-        base[f'rps_{p}d'] = rps_dict[p].loc[sub_dates].stack().values
-        base[f'ret_{p}d'] = ret_dict[p].loc[sub_dates].stack().values
-    base['rps_composite'] = comp.loc[sub_dates].stack().values
+        s = ret_dict[p].loc[sub_dates].stack().rename(f'ret_{p}d')
+        base = base.join(s, on=['date', 'code'])
+    s = comp.loc[sub_dates].stack().rename('rps_composite')
+    base = base.join(s, on=['date', 'code'])
     c2n, _ = load_industry_map(); base['name'] = base['code'].map(c2n)
     pool = rps_dict[20].loc[sub_dates].notna().sum(axis=1)
     base['pool_size'] = pool.reindex(base['date']).values

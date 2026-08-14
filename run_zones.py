@@ -10,7 +10,81 @@ from pathlib import Path
 
 from zone1_deposition import run as l1_run
 from verify_buy_type import verify_buy_type, check_resonance
+
 from zone2_regime import run as l2_run
+from pathlib import Path
+
+# ── 30分钟信号按需生成 ─────────────────────────────────────────
+SIG_30MIN_PATH = Path("data/signals_30min")
+MIN30_DATA = Path("data/min30")
+
+
+def ensure_30min(codes):
+    """按需生成 30min 信号（仅对需要共振检查的候选）。"""
+    import pandas as pd
+    from czsc import RawBar, Freq, generate_czsc_signals
+    import signal_config
+    if not codes:
+        return
+
+    # 确定参考日期
+    daily_sig_dir = Path("data/signals")
+    ref_dates = []
+    for sig_f in sorted(daily_sig_dir.glob("*.parquet"))[-200:]:
+        df = pd.read_parquet(sig_f, columns=["dt"])
+        ref_dates.append(pd.Timestamp(df["dt"].max()))
+    ref_date = max(ref_dates) if ref_dates else pd.Timestamp.now()
+
+    # 找出需要生成的代码
+    todo = []
+    SIG_30MIN_PATH.mkdir(parents=True, exist_ok=True)
+    for c in codes:
+        sig_f = SIG_30MIN_PATH / f"{c}.parquet"
+        if not sig_f.exists():
+            todo.append(c)
+        else:
+            try:
+                df = pd.read_parquet(sig_f)
+                if pd.Timestamp(df["dt"].max()) < ref_date:
+                    todo.append(c)
+            except Exception:
+                todo.append(c)
+
+    if not todo:
+        logger.info("30min 信号无缺失，跳过")
+        return
+
+    t0 = time.time()
+    logger.info("30min 按需生成: %d 只", len(todo))
+    sig_config = signal_config.get_config(freq="30分钟")
+    success = 0
+    for i, code in enumerate(todo):
+        if (i + 1) % 50 == 0 or i == len(todo) - 1:
+            logger.info("  30min: %d/%d (%.0fs)", i + 1, len(todo), time.time() - t0)
+        try:
+            df = pd.read_parquet(MIN30_DATA / f"{code}.parquet")
+            if len(df) < 200:
+                continue
+            df = df.sort_values("date").tail(800)
+            bars = [
+                RawBar(symbol=code, id=j+1, dt=r["date"].to_pydatetime(),
+                       freq=Freq.F30, open=r["open"], close=r["close"],
+                       high=r["high"], low=r["low"],
+                       vol=float(r.get("volume", 0)), amount=float(r.get("amount", 0)))
+                for j, (_, r) in enumerate(df.iterrows())
+            ]
+            sdt = str(df["date"].iloc[0].date()).replace("-", "")
+            sigs = generate_czsc_signals(
+                bars, signals_config=sig_config, tqdm_kwargs={"disable": True},
+                sdt=sdt, init_n=min(100, len(bars)), df=True)
+            if sigs is not None and not sigs.empty:
+                sigs = sigs.drop(columns=[c for c in ["freq", "cache"] if c in sigs.columns])
+                sigs.to_parquet(SIG_30MIN_PATH / f"{code}.parquet", index=False)
+                success += 1
+        except Exception:
+            pass
+    logger.info("30min 完成: %d/%d (%.0fs)", success, len(todo), time.time() - t0)
+
 import regime_detector
 from zone3_regime import run as l3_run
 from zone4_regime import run as l4_run
@@ -54,20 +128,44 @@ def main():
         return
     logger.info("L1 完成: %d 只 (%.1fs)", len(df1), time.time() - t0)
 
-    # L2: 计算 B+ 通过股票，不设阈值
-    bplus_codes = set()
-    resonance_count = 0
+    # B+ 统计（对齐回测设计：verify=加分不豁免, resonance=仅计数, bplus 由 zone2_regime 内部三级联立填充）
+    from verify_buy_type import check_weekly_structural_resonance
+
+    bplus_codes = set()        # 由 zone2_regime 内部三级联立填充，B+ 循环不写入
+    bplus_verify_count = 0     # 结构合规（加分不豁免）
+    resonance_count = 0        # 三级标签共振（仅计数）
+    resonance_candidates = []  # 需要共振检查的候选（二/三买且结构验证失败）
+
     for _, row in df1.iterrows():
         code = row["代码"]
         label = row["买点类型"]
         bt = "一买" if "一买" in label else ("二买" if "二买" in label else "三买")
-        if bt != "一买" and verify_buy_type(code, bt):
-            bplus_codes.add((code, bt))
-        elif check_resonance(code, bt, signal_date=row.get("最新日期")):
-            bplus_codes.add((code, bt))
-            resonance_count += 1
-    logger.info("B+ 通过: %d 只 (结构%d + 共振%d)", len(bplus_codes),
-                len(bplus_codes) - resonance_count, resonance_count)
+        if bt == "一买":
+            continue
+        # 独立检查，不互斥：一只股票可以同时结构合规+周日共振
+        if verify_buy_type(code, bt):
+            bplus_verify_count += 1  # 加分不豁免
+        resonance_candidates.append((code, bt, row.get("最新日期")))  # 所有非一买都检查共振
+
+    # 周日共振预筛：只对日线+周线结构匹配的候选生成 30min
+    if resonance_candidates:
+        rc_codes = list(set(c for c, _, _ in resonance_candidates))
+        prescreened = set()
+        for c in rc_codes:
+            try:
+                if check_weekly_structural_resonance(c):
+                    prescreened.add(c)
+            except Exception:
+                pass
+        logger.info("周日共振预筛: %d/%d 只通过", len(prescreened), len(rc_codes))
+
+        if prescreened:
+            ensure_30min(list(prescreened))
+            for code, bt, sig_date in resonance_candidates:
+                if code in prescreened and check_resonance(code, bt, signal_date=sig_date):
+                    resonance_count += 1  # 仅计数（对齐回测）
+    logger.info("B+: %d只(加分) %d只(共振)",
+                bplus_verify_count, resonance_count)
 
     # L2: Regime 路由
     logger.info("=" * 40)

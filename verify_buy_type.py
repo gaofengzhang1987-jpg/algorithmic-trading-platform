@@ -18,7 +18,11 @@ SIG_DIR = WORKDIR / "data" / "signals"
 SIG_WEEKLY_DIR = WORKDIR / "data" / "signals_weekly"
 SIG_30MIN_DIR = WORKDIR / "data" / "signals_30min"
 STRUCT_DIR = WORKDIR / "data" / "struct_cache"
+STRUCT_30M_DIR = WORKDIR / "data" / "struct_cache_30m"
+STRUCT_WEEKLY_DIR = WORKDIR / "data" / "struct_cache_weekly"
 DAILY_DIR = WORKDIR / "data" / "daily"
+from core.date_utils import get_effective_date
+from core.date_utils import get_effective_date
 
 
 # ========== 验证入口（原接口不变）==========
@@ -359,13 +363,20 @@ SIG_DIR = WORKDIR / "data" / "signals"
 SIG_WEEKLY_DIR = WORKDIR / "data" / "signals_weekly"
 SIG_30MIN_DIR = WORKDIR / "data" / "signals_30min"
 STRUCT_DIR = WORKDIR / "data" / "struct_cache"
+STRUCT_30M_DIR = WORKDIR / "data" / "struct_cache_30m"
+STRUCT_WEEKLY_DIR = WORKDIR / "data" / "struct_cache_weekly"
 DAILY_DIR = WORKDIR / "data" / "daily"
+from core.date_utils import get_effective_date
+from core.date_utils import get_effective_date
 
 
 # ========== 验证入口（原接口不变）==========
 
 
 # ——— 三级联立共振检测 ———
+
+
+# ========== 周日共振预筛 ==========
 
 def check_resonance(code: str, buy_type: str, signal_date=None) -> bool:
     """三级联立：日线+周线+30min 是否同时存在同一买点类型（严格时间对齐）。
@@ -393,7 +404,7 @@ def check_resonance(code: str, buy_type: str, signal_date=None) -> bool:
         "周线":  (SIG_WEEKLY_DIR / f"{code}.parquet", 5),
         "30分钟": (SIG_30MIN_DIR / f"{code}.parquet", 2),
     }
-    now = pd.Timestamp.now()
+    now = get_effective_date()
     if signal_date is not None:
         signal_date = pd.Timestamp(signal_date)
     
@@ -427,8 +438,202 @@ def check_resonance(code: str, buy_type: str, signal_date=None) -> bool:
     return True
 
 
-def check_structural_resonance(code: str, buy_type: str, signal_date=None,
-                               m30_signal_dt=None, weekly_signal_dt=None) -> bool:
-    """三级联立结构共振检查（桩函数，by l3_filter + zone2_regime）。"""
-    # 历史回测环境不使用 struct_cache，始终返回 False
-    return False
+# ——— 结构级共振检测（2026-08-07 新增）———
+
+def check_structural_resonance(code: str, buy_type: str, signal_date=None, m30_signal_dt=None, weekly_signal_dt=None) -> bool:
+    """结构级三级联立：三级别底分型同价区 + 中枢重叠 + 信号时间对齐。
+
+    6 条件全过才标记 [周_日_30m_结构联立]：
+    1. 日线 → 取最后向下笔 low + 中枢区间
+    2. 30min → 向下笔 low 与日线偏差 < 5%
+    3. 日线+30min → 中枢重叠（任一级别缺中枢则跳过）
+    4. 周线 → 最后向下笔 low 与日线偏差 < 2%
+    5. 日线+周线 → 中枢重叠（任一级别缺中枢则跳过）
+    6. 三级信号时间对齐 ≤ 5 天（缺信号文件 → 不标记）
+
+    Args:
+        code: 股票代码
+        buy_type: '一买' | '二买' | '三买'（一买跳过，直接 False）
+        signal_date: 日线信号日期
+        m30_signal_dt: 30min 信号文件最新日期（可选，用于时间对齐）
+        weekly_signal_dt: 周线信号文件最新日期（可选，用于时间对齐）
+    Returns:
+        True 当且仅当底分型同价区 + 中枢重叠 + 时间对齐
+    """
+    if buy_type == "一买":
+        return False
+
+    if signal_date is not None:
+        signal_date = pd.Timestamp(signal_date)
+    else:
+        signal_date = get_effective_date()
+
+    PRICE_TOLERANCE = 0.02
+
+    sp = STRUCT_DIR / f"{code}.parquet"
+    if not sp.exists():
+        return False
+    try:
+        sd = pd.read_parquet(sp)
+        sd["sdt_dt"] = pd.to_datetime(sd["sdt"])
+        sd["edt_dt"] = pd.to_datetime(sd["edt"])
+        pre_d = sd[sd["sdt_dt"].dt.date <= signal_date.date()]
+        d_down = pre_d[pre_d["direction"] == "向下"]
+        if len(d_down) == 0:
+            return False
+        d_bottom = d_down.iloc[-1]
+        d_low = float(d_bottom["low"])
+        d_bottom_sdt = pd.to_datetime(d_bottom["sdt"])
+        d_bottom_edt = pd.to_datetime(d_bottom["edt"])
+
+        d_pivots = pre_d[pre_d["direction"] == "pivot"]
+        if len(d_pivots) == 0:
+            d_zg, d_zd = 0.0, 0.0
+        else:
+            lp = d_pivots.iloc[-1]
+            d_zg = float(lp.get("pivot_zg", 0) or 0)
+            d_zd = float(lp.get("pivot_zd", 0) or 0)
+    except Exception:
+        return False
+
+    # --- 30min 价格 + 中枢 + 包含 ---
+    sp30 = STRUCT_30M_DIR / f"{code}.parquet"
+    if not sp30.exists():
+        return False
+    try:
+        s30 = pd.read_parquet(sp30)
+        s30["sdt_dt"] = pd.to_datetime(s30["sdt"])
+        s30["edt_dt"] = pd.to_datetime(s30["edt"])
+        pre_30 = s30[s30["sdt_dt"].dt.date <= signal_date.date()]
+        m30_down = pre_30[pre_30["direction"] == "向下"]
+        if len(m30_down) == 0:
+            return False
+
+        # 条件 2: 30min 价格对齐（只取最后向下笔，容差 3%，2026-08-10）
+        m30_last = m30_down.iloc[-1]
+        if abs(m30_last["low"] - d_low) / d_low >= 0.03:
+            return False
+
+        # 条件 3: 日线+30min 中枢重叠
+        m30_pivots = pre_30[pre_30["direction"] == "pivot"]
+        has_m30_pivot = len(m30_pivots) > 0
+        has_d_pivot = not (d_zg == 0 and d_zd == 0)
+        if has_m30_pivot and has_d_pivot:
+            lp30 = m30_pivots.iloc[-1]
+            m30_zg = float(lp30.get("pivot_zg", 0) or 0)
+            m30_zd = float(lp30.get("pivot_zd", 0) or 0)
+            if not (min(m30_zg, d_zg) >= max(m30_zd, d_zd)):
+                return False
+    except Exception:
+        return False
+
+    # --- 周线 价格 + 中枢 + 重叠 ---
+    wp = STRUCT_WEEKLY_DIR / f"{code}.parquet"
+    if not wp.exists():
+        return False
+    try:
+        sw = pd.read_parquet(wp)
+        sw["sdt_dt"] = pd.to_datetime(sw["sdt"])
+        sw["edt_dt"] = pd.to_datetime(sw["edt"])
+        pre_w = sw[sw["sdt_dt"] <= signal_date]
+        w_down = pre_w[pre_w["direction"] == "向下"]
+        if len(w_down) == 0:
+            return False
+
+        # 条件 4: 周线价格对齐（只取最后向下笔，容差 2%，2026-08-10）
+        w_last = w_down.iloc[-1]
+        if abs(w_last["low"] - d_low) / d_low >= 0.02:
+            return False
+
+        # 条件 5: 日线+周线 中枢重叠
+        w_pivots = pre_w[pre_w["direction"] == "pivot"]
+        has_w_pivot = len(w_pivots) > 0
+        has_d_pivot = not (d_zg == 0 and d_zd == 0)
+        if has_w_pivot and has_d_pivot:
+            lpw = w_pivots.iloc[-1]
+            w_zg = float(lpw.get("pivot_zg", 0) or 0)
+            w_zd = float(lpw.get("pivot_zd", 0) or 0)
+            if not (min(w_zg, d_zg) >= max(w_zd, d_zd)):
+                return False
+    except Exception:
+        return False
+
+    # 条件 6: 三级信号时间对齐（缺任一信号文件 → 直接不标记）
+    if m30_signal_dt is None or weekly_signal_dt is None:
+        return False
+    d_dt = signal_date
+    if not (abs((m30_signal_dt - d_dt).days) <= 5 and
+            abs((weekly_signal_dt - d_dt).days) <= 5 and
+            abs((weekly_signal_dt - m30_signal_dt).days) <= 5):
+        return False
+
+    return True
+
+# --- 周-日结构共振检测 (2026-08-07) ---
+
+def check_weekly_structural_resonance(code: str, signal_date=None) -> bool:
+    """周日结构共振: 日线底分型与周线底分型是否在同一价格区。
+
+    读取 data/struct_cache/ 和 data/struct_cache_weekly/，
+    检查信号日之前的日线最后向下笔 low 与周线最后向下笔 low 偏差 < 2%，且日线/周线最后中枢区间重叠（借鉴三级联立，2026-08-09）。
+    """
+    if signal_date is not None:
+        signal_date = pd.Timestamp(signal_date)
+    else:
+        signal_date = get_effective_date()
+
+    PRICE_TOLERANCE = 0.02
+
+    sp = STRUCT_DIR / f"{code}.parquet"
+    if not sp.exists():
+        return False
+    try:
+        sd = pd.read_parquet(sp)
+        sd["sdt_dt"] = pd.to_datetime(sd["sdt"])
+        sd["edt_dt"] = pd.to_datetime(sd["edt"])
+        pre_d = sd[sd["sdt_dt"].dt.date <= signal_date.date()]
+        d_down = pre_d[pre_d["direction"] == "向下"]
+        if len(d_down) == 0:
+            return False
+        d_low = float(d_down.iloc[-1]["low"])
+    except Exception:
+        return False
+
+    wp = STRUCT_WEEKLY_DIR / f"{code}.parquet"
+    if not wp.exists():
+        return False
+    try:
+        sw = pd.read_parquet(wp)
+        sw["sdt_dt"] = pd.to_datetime(sw["sdt"])
+        pre_w = sw[sw["sdt_dt"] <= signal_date]
+        w_down = pre_w[pre_w["direction"] == "向下"]
+        if len(w_down) == 0:
+            return False
+
+        # 只取周线最后向下笔（与日线最后向下笔对齐，不做全历史扫描）
+        w_last_low = float(w_down.iloc[-1]["low"])
+        if not (abs(w_last_low - d_low) / d_low < PRICE_TOLERANCE):
+            return False
+
+        # 中枢重叠检查（借鉴三级联立）：日线最后中枢与周线最后中枢区间重叠
+        d_pivots = pre_d[pre_d["direction"] == "pivot"]
+        w_pivots = pre_w[pre_w["direction"] == "pivot"]
+        has_d_pivot = len(d_pivots) > 0
+        has_w_pivot = len(w_pivots) > 0
+        if has_d_pivot and has_w_pivot:
+            lp_d = d_pivots.iloc[-1]
+            d_zg = float(lp_d.get("pivot_zg", 0) or 0)
+            d_zd = float(lp_d.get("pivot_zd", 0) or 0)
+            lp_w = w_pivots.iloc[-1]
+            w_zg = float(lp_w.get("pivot_zg", 0) or 0)
+            w_zd = float(lp_w.get("pivot_zd", 0) or 0)
+            if d_zg == 0 and d_zd == 0:
+                pass  # 日线无有效中枢 → 跳过
+            elif w_zg == 0 and w_zd == 0:
+                pass  # 周线无有效中枢 → 跳过
+            elif not (min(d_zg, w_zg) >= max(d_zd, w_zd)):
+                return False  # 中枢不重叠
+        return True
+    except Exception:
+        return False
+
