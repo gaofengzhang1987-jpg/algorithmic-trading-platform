@@ -15,6 +15,8 @@ import argparse, subprocess, sys, time, json, shutil
 from pathlib import Path
 import pandas as pd
 
+from manual_backtest.report import export_trades_csv
+
 BASE = Path(__file__).resolve().parent.parent
 TMP = BASE / "tmp_out"
 WORKER = TMP / "hist_worker.py"
@@ -164,7 +166,8 @@ def _lookup_regime(date: str) -> str | None:
 def _patch_paths(bt_data: Path, cutoff: pd.Timestamp, historical_regime: str = None):
     """Monkey-patch 数据目录指向历史回测目录。返回 restore 函数。"""
     import verify_buy_type, zone1_deposition, zone2_regime, zone3_regime, l3_filter
-    import core.date_utils
+    from backtest import exit_engine
+    import core.date_utils, core.data, core.structure_cache
     _orig_get_effective = core.date_utils.get_effective_date
     core.date_utils.get_effective_date = lambda: cutoff
     # 同时 patch 使用 from-import 的模块本地绑定（Python 不会自动更新）
@@ -193,11 +196,15 @@ def _patch_paths(bt_data: Path, cutoff: pd.Timestamp, historical_regime: str = N
     _p(zone2_regime, "STRUCT_DIR", bt_data / "struct_cache")
     _p(zone2_regime, "STRUCT_30M_DIR", bt_data / "struct_cache_30m")
     _p(zone2_regime, "STRUCT_WEEKLY_DIR", bt_data / "struct_cache_weekly")
+    _p(core.data, "DATA_DIR", bt_data / "daily")
+    _p(core.data, "SIGNALS_DIR", bt_data / "signals")
+    _p(core.structure_cache, "STRUCT_DIR", bt_data / "struct_cache")
     (bt_data / "zones").mkdir(parents=True, exist_ok=True)
     _p(zone2_regime, "ZONES", bt_data / "zones")
     if hasattr(zone3_regime, "ZONES"):
         _p(zone3_regime, "ZONES", bt_data / "zones")
     _p(l3_filter, "DAILY", bt_data / "daily")
+    _p(exit_engine, "STRUCT_30M_DIR", bt_data / "struct_cache_30m")
 
 
     # Inject historical regime to replace regime_detector.detect()
@@ -331,6 +338,39 @@ def run(date: str, sample: int = 0, workers: int = 4):
 
     print(f"\n产物: {bt_dir}/")
     return l4 if 'l4' in dir() else None
+
+
+def run_exit_backtest(date: str) -> pd.DataFrame:
+    """用截面重建的数据跑全量 L4 出场回测（必须在清理 data/ 前调用）。"""
+    bt_dir = TMP / f"backtest_{date}"
+    bt_data = bt_dir / "data"
+    l4_path = bt_dir / f"l4_{date}.csv"
+    if not l4_path.exists():
+        return pd.DataFrame()
+
+    df = pd.read_csv(l4_path, encoding="utf-8-sig")
+    df = df.copy()
+    df["selected"] = 1
+    if "code" in df.columns:
+        df["code"] = df["code"].astype(str).str.zfill(6)
+
+    from manual_backtest.engine import ManualBacktester
+    restore = _patch_paths(bt_data, pd.Timestamp(date))
+    try:
+        bt = ManualBacktester()
+        bt.marked = df.reset_index(drop=True)
+        bt._current_date = date
+        trades = bt.backtest_selected()
+    finally:
+        restore()
+
+    if trades.empty:
+        return trades
+    trades["section_date"] = date
+    out_dir = TMP / "exit_backtest_per_section"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    export_trades_csv(trades, out_dir / f"trades_{date}.csv")
+    return trades
 
 
 if __name__ == "__main__":

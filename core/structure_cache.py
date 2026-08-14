@@ -6,6 +6,7 @@ from core.constants import BASE_DIR
 _structure_cache = None
 _struct_path = BASE_DIR / "data" / "reference" / "structure_cache.parquet"
 _structure_cache = pd.read_parquet(_struct_path) if _struct_path.exists() else None
+STRUCT_DIR = BASE_DIR / "data" / "struct_cache"
 
 
 def load_structure_cache():
@@ -35,7 +36,7 @@ def load_structure_for_code(code: str):
     """加载单只股票的结构缓存（含 direction/high/low/sdt/edt/pivot_dir 等详细列）。
     从 data/struct_cache/{code}.parquet 读取；不存在则返回 None。
     """
-    p = BASE_DIR / "data" / "struct_cache" / f"{code}.parquet"
+    p = STRUCT_DIR / f"{code}.parquet"
     if p.exists():
         return pd.read_parquet(p)
     return None

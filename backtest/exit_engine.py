@@ -19,8 +19,11 @@ class BarResult:
     trajectory: list = None
 
 
+STRUCT_30M_DIR = BASE_DIR / "data" / "struct_cache_30m"
+
+
 def _load_struct_30m(code):
-    p30 = BASE_DIR / "data" / "struct_cache_30m" / f"{code}.parquet"
+    p30 = STRUCT_30M_DIR / f"{code}.parquet"
     if not p30.exists():
         return None
     return pd.read_parquet(p30)
