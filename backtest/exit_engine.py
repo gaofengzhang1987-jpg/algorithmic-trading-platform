@@ -99,7 +99,8 @@ class ExitEngine:
 
         up_pivots = sdf[
             (sdf["pivot_dir"] == "上涨") &
-            (pd.to_datetime(sdf["sdt"]).dt.date <= entry_d)
+            (pd.to_datetime(sdf["sdt"]).dt.date <= entry_d) &
+            (pd.to_datetime(sdf["edt"]).dt.date <= entry_d)
         ]
         if len(up_pivots) > 0:
             self.entry_pivot_gg = float(up_pivots.iloc[-1]["pivot_gg"])
@@ -274,7 +275,8 @@ class ExitEngine:
             up_pivots = sdf[
                 (sdf["pivot_dir"] == "上涨") &
                 (pd.to_datetime(sdf["sdt"]).dt.date > self.entry_date.date()) &
-                (pd.to_datetime(sdf["sdt"]).dt.date <= bar_d)
+                (pd.to_datetime(sdf["sdt"]).dt.date <= bar_d) &
+                (pd.to_datetime(sdf["edt"]).dt.date <= bar_d)
             ]
             if len(up_pivots) > 0:
                 new_gg = float(up_pivots.iloc[-1]["pivot_gg"])

@@ -74,6 +74,13 @@ class ManualBacktester:
 
 复用 `smoke_test.py` 中的 `detect_regime()` 和管道逻辑，但不写死 top-N。
 
+#### 历史截面数据隔离（2026-08-14 修正）
+
+`historical.py` 重建截面数据时，RPS 等参考数据也按 cutoff 截断写入
+`{bt_dir}/data/reference/`，并 patch `L3Filter` / `zone3_regime` 的
+`STOCK_RPS` / `INDUSTRY_RPS` / `INDUSTRY_MAP` 指向截面快照；
+同时清空 `L3Filter` 类级 RPS 缓存，防止复用当前全量最新值造成未来数据污染。
+
 ### 3.2 backtest_selected 流程
 
 ```

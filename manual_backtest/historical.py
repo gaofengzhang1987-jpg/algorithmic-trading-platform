@@ -163,9 +163,28 @@ def _lookup_regime(date: str) -> str | None:
     return None
 
 
+def _snapshot_reference_data(bt_data: Path, cutoff: pd.Timestamp):
+    """把 RPS 等参考数据按 cutoff 截断写入截面目录，避免历史截面读取全量最新值。"""
+    ref_dir = bt_data / "reference"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("stock_rps", "industry_rps"):
+        src = BASE / "data" / "reference" / f"{name}.parquet"
+        dst = ref_dir / f"{name}.parquet"
+        if not src.exists():
+            continue
+        df = pd.read_parquet(src)
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"])
+            df = df[df["date"] <= cutoff]
+        df.to_parquet(dst, index=False)
+    src = BASE / "data" / "industry_classification.parquet"
+    if src.exists():
+        shutil.copy2(src, ref_dir / "industry_classification.parquet")
+
+
 def _patch_paths(bt_data: Path, cutoff: pd.Timestamp, historical_regime: str = None):
     """Monkey-patch 数据目录指向历史回测目录。返回 restore 函数。"""
-    import verify_buy_type, zone1_deposition, zone2_regime, zone3_regime, l3_filter
+    import verify_buy_type, zone1_deposition, zone2_regime, zone3_regime, zone4_regime, l3_filter
     from backtest import exit_engine
     import core.date_utils, core.data, core.structure_cache
     _orig_get_effective = core.date_utils.get_effective_date
@@ -203,9 +222,22 @@ def _patch_paths(bt_data: Path, cutoff: pd.Timestamp, historical_regime: str = N
     _p(zone2_regime, "ZONES", bt_data / "zones")
     if hasattr(zone3_regime, "ZONES"):
         _p(zone3_regime, "ZONES", bt_data / "zones")
+    _p(zone3_regime, "STOCK_RPS", bt_data / "reference" / "stock_rps.parquet")
+    _p(zone3_regime, "INDUSTRY_RPS", bt_data / "reference" / "industry_rps.parquet")
+    _p(zone3_regime, "INDUSTRY_MAP", bt_data / "reference" / "industry_classification.parquet")
     _p(l3_filter, "DAILY", bt_data / "daily")
+    _p(l3_filter, "STOCK_RPS", bt_data / "reference" / "stock_rps.parquet")
+    _p(l3_filter, "INDUSTRY_RPS", bt_data / "reference" / "industry_rps.parquet")
+    _p(l3_filter, "INDUSTRY_MAP", bt_data / "reference" / "industry_classification.parquet")
+    _p(zone4_regime, "ZONES", bt_data / "zones")
     _p(exit_engine, "STRUCT_30M_DIR", bt_data / "struct_cache_30m")
 
+    # L3Filter 类级 RPS 缓存会绕过路径 patch，这里强制清空，restore 时恢复原值
+    _orig_class = {}
+    for attr in ("_rps_stock", "_rps_industry", "_industry_map"):
+        if hasattr(l3_filter.L3Filter, attr):
+            _orig_class[(l3_filter.L3Filter, attr)] = getattr(l3_filter.L3Filter, attr)
+            setattr(l3_filter.L3Filter, attr, None)
 
     # Inject historical regime to replace regime_detector.detect()
     _orig_detect = None
@@ -222,9 +254,67 @@ def _patch_paths(bt_data: Path, cutoff: pd.Timestamp, historical_regime: str = N
         core.date_utils.get_effective_date = _orig_get_effective
         zone2_regime.get_effective_date = _orig_get_effective
         verify_buy_type.get_effective_date = _orig_get_effective
+        for (cls, attr), val in _orig_class.items():
+            setattr(cls, attr, val)
         for (mod, attr), val in _orig.items():
             setattr(mod, attr, val)
     return restore
+
+
+def _patch_exit_data_paths(bt_data: Path):
+    """把出场回测数据源指向截面目录，避免使用当前全量信号/结构造成未来数据污染。"""
+    import backtest.exit_engine
+    import core.data
+    import core.structure_cache
+
+    _orig = {}
+    for mod, attr, val in [
+        (core.data, "DATA_DIR", bt_data / "daily"),
+        (core.data, "SIGNALS_DIR", bt_data / "signals"),
+        (core.structure_cache, "STRUCT_DIR", bt_data / "struct_cache"),
+        (backtest.exit_engine, "STRUCT_30M_DIR", bt_data / "struct_cache_30m"),
+    ]:
+        _orig[(mod, attr)] = getattr(mod, attr)
+        setattr(mod, attr, val)
+
+    def restore():
+        for (mod, attr), val in _orig.items():
+            setattr(mod, attr, val)
+    return restore
+
+
+def run_exit_backtest_for_section(bt_dir: Path, date: str) -> int:
+    """截面内立即出场回测：使用本截面构建的 daily/signals/struct，跑完全部 L4 候选。"""
+    l4_path = bt_dir / f"l4_{date}.csv"
+    if not l4_path.exists():
+        return 0
+    df = pd.read_csv(l4_path, encoding="utf-8-sig")
+    if df.empty:
+        return 0
+    df = df.copy()
+    df["selected"] = 1
+    df["code"] = df["code"].astype(str).str.zfill(6)
+
+    from manual_backtest.engine import ManualBacktester
+    from manual_backtest.report import export_trades_csv
+
+    restore = _patch_exit_data_paths(bt_dir / "data")
+    try:
+        bt = ManualBacktester()
+        bt.marked = df.reset_index(drop=True)
+        bt._current_date = date
+        trades = bt.backtest_selected()
+    finally:
+        restore()
+
+    if trades.empty:
+        return 0
+    trades = trades.copy()
+    trades["section_date"] = date
+    out_dir = TMP / "exit_backtest_strict"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    export_trades_csv(trades, out_dir / f"trades_{date}.csv")
+    return len(trades)
 
 
 def run(date: str, sample: int = 0, workers: int = 4):
@@ -255,6 +345,8 @@ def run(date: str, sample: int = 0, workers: int = 4):
         n = filter_kline(src, dst, date, freq)
         all_codes[freq] = sorted(p.stem for p in dst.glob("*.parquet"))
         print(f"  {freq}: {n} 只")
+
+    _snapshot_reference_data(bt_data, cutoff)
 
     if sample > 0:
         import random; random.seed(42)
@@ -336,6 +428,8 @@ def run(date: str, sample: int = 0, workers: int = 4):
     finally:
         restore()
 
+    n_exit = run_exit_backtest_for_section(bt_dir, date)
+    print(f"  严格出场回测: {n_exit} 笔")
     print(f"\n产物: {bt_dir}/")
     return l4 if 'l4' in dir() else None
 

@@ -59,6 +59,7 @@ def main():
                     "fx_b_mark": str(bi.fx_b.mark) if hasattr(bi.fx_b, "mark") else "",
                     "fx_b_low": float(bi.fx_b.low) if hasattr(bi.fx_b, "low") else 0.0,
                     "fx_a_mark": str(bi.fx_a.mark) if hasattr(bi.fx_a, "mark") else "",
+                    "fx_b_has_zs": bool(getattr(bi.fx_b, "has_zs", False)),
                     "pivot_dir": math.nan, "pivot_gg": math.nan,
                     "pivot_zd": math.nan, "pivot_zg": math.nan})
 
@@ -86,6 +87,7 @@ def main():
                         "high": float(gg), "low": float(dd),
                         "sdt": bl[j].sdt, "edt": bl[k-1].edt if k < len(bl) else bl[-1].edt,
                         "power": 0.0, "fx_b_mark": "", "fx_b_low": 0.0, "fx_a_mark": "",
+                        "fx_b_has_zs": pd.NA,
                         "pivot_dir": pd_, "pivot_gg": float(gg),
                         "pivot_zd": float(zd), "pivot_zg": float(zg)})
                     j = k
@@ -93,7 +95,7 @@ def main():
                     j += 1
 
             df_out = pd.DataFrame(rows)
-            col_order = ["direction","edt","fx_a_mark","fx_b_low","fx_b_mark",
+            col_order = ["direction","edt","fx_a_mark","fx_b_low","fx_b_mark","fx_b_has_zs",
                          "high","low","pivot_dir","pivot_gg","pivot_zd","pivot_zg",
                          "power","sdt"]
             df_out = df_out[col_order]
