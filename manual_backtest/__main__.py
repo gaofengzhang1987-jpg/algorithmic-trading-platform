@@ -1,4 +1,4 @@
-"""CLI entry: python3 -m manual_backtest date|batch|backtest|analyze."""
+"""CLI entry: python3 -m manual_backtest historical|auto|backtest|analyze."""
 import sys
 from pathlib import Path
 
@@ -13,9 +13,10 @@ _OUT_BASE = Path(__file__).parent.parent / "tmp_out" / "manual_backtest"
 
 
 def _usage() -> None:
-    print("Usage: python3 -m manual_backtest {historical|backtest|analyze} [args...]")
-    
+    print("Usage: python3 -m manual_backtest {historical|auto|backtest|analyze} [args...]")
+
     print("  historical YYYY-MM-DD [--sample N] [--workers N]")
+    print("  auto [--l4-dir DIR] [--out-dir DIR] [--limit N] [--force]")
     print("  backtest MARKED_CSV [--out OUT]")
     print("  analyze TRADES_CSV [--auto-csv AUTO] [--compare-top N]")
 
@@ -71,6 +72,17 @@ def main():
         a, _ = ap.parse_known_args(sys.argv[2:])
         from manual_backtest.historical import run
         run(a.date, sample=a.sample, workers=a.workers)
+    elif cmd == "auto":
+        import argparse
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--l4-dir", default=None)
+        ap.add_argument("--out-dir", default=None)
+        ap.add_argument("--limit", type=int, default=0)
+        ap.add_argument("--force", action="store_true")
+        a, _ = ap.parse_known_args(sys.argv[2:])
+        bt = ManualBacktester()
+        bt.backtest_all_l4(l4_dir=a.l4_dir, out_dir=a.out_dir,
+                           limit=a.limit, force=a.force)
     elif cmd == "backtest":
         if len(sys.argv) < 3:
             print("Usage: python3 -m manual_backtest backtest MARKED_CSV [--out OUT]"); sys.exit(1)

@@ -91,8 +91,77 @@ def generate_signals(codes: list, data_dir: Path, sig_dir: Path,
     print(f"  [{freq}] 完成 {time.time()-t0:.0f}s, {n} 信号文件")
     return n
 
+STRUCT_WORKER = BASE / "manual_backtest" / "hist_worker_struct.py"
 
-def _patch_paths(bt_data: Path, cutoff: pd.Timestamp):
+
+def build_struct_cache(codes: list, data_dir: Path, struct_dir: Path,
+                       freq: str, n_workers: int = 4):
+    """Build struct_cache (bi + pivot) from filtered K-line data."""
+    if not codes:
+        return 0
+    chunks = [[] for _ in range(n_workers)]
+    for idx, code in enumerate(codes):
+        chunks[idx % n_workers].append(code)
+
+    print(f"  [struct_{freq}] {len(codes)} stocks, {n_workers} workers")
+    t0 = time.time()
+    procs, lfs, pfs, cfs = [], [], [], []
+
+    for i in range(n_workers):
+        if not chunks[i]:
+            continue
+        cfg = TMP / f"struct_cfg_{freq}_{i}.json"
+        pf = TMP / f"struct_prog_{freq}_{i}.txt"
+        lf = open(str(TMP / f"struct_log_{freq}_{i}.log"), "w")
+        with open(cfg, "w") as f:
+            json.dump({"codes": chunks[i], "data_dir": str(data_dir),
+                       "struct_dir": str(struct_dir), "freq": freq,
+                       "progress_file": str(pf)}, f)
+        p = subprocess.Popen(
+            [sys.executable, "-u", str(STRUCT_WORKER), str(cfg)],
+            stdout=lf, stderr=subprocess.STDOUT)
+        procs.append(p); lfs.append(lf); pfs.append(pf); cfs.append(cfg)
+
+    while any(p.poll() is None for p in procs):
+        time.sleep(30)
+        for pf in pfs:
+            if pf.exists():
+                t = pf.read_text().strip()
+                if t: print(f"    {t}")
+        d = sum(1 for p in procs if p.poll() is not None)
+        print(f"    [struct_{freq}] {d}/{len(procs)} done {time.time()-t0:.0f}s")
+
+    for lf in lfs: lf.close()
+    for cf in cfs: cf.unlink(missing_ok=True)
+    for pf in pfs: pf.unlink(missing_ok=True)
+
+    n = len(list(struct_dir.glob("*.parquet"))) if struct_dir.exists() else 0
+    print(f"  [struct_{freq}] done {time.time()-t0:.0f}s, {n} struct files")
+    return n
+
+
+def _lookup_regime(date: str) -> str | None:
+    """Look up historical regime from pre-computed history."""
+    history_path = TMP / "regime_history.parquet"
+    if not history_path.exists():
+        return None
+    try:
+        df = pd.read_parquet(history_path)
+        df["date"] = pd.to_datetime(df["date"])
+        target = pd.Timestamp(date)
+        row = df[df["date"] == target]
+        if len(row) == 0:
+            before = df[df["date"] <= target]
+            if len(before) > 0:
+                row = before.iloc[[-1]]
+        if len(row) > 0:
+            return row["regime"].values[0]
+    except Exception:
+        pass
+    return None
+
+
+def _patch_paths(bt_data: Path, cutoff: pd.Timestamp, historical_regime: str = None):
     """Monkey-patch 数据目录指向历史回测目录。返回 restore 函数。"""
     import verify_buy_type, zone1_deposition, zone2_regime, zone3_regime, l3_filter
     import core.date_utils
@@ -130,7 +199,19 @@ def _patch_paths(bt_data: Path, cutoff: pd.Timestamp):
         _p(zone3_regime, "ZONES", bt_data / "zones")
     _p(l3_filter, "DAILY", bt_data / "daily")
 
+
+    # Inject historical regime to replace regime_detector.detect()
+    _orig_detect = None
+    if historical_regime is not None:
+        import regime_detector
+        _orig_detect = regime_detector.detect
+        regime_detector.detect = lambda *a, **kw: (
+            historical_regime, 50.0, {"historical": True}, 50.0
+        )
+
     def restore():
+        if _orig_detect is not None:
+            regime_detector.detect = _orig_detect
         core.date_utils.get_effective_date = _orig_get_effective
         zone2_regime.get_effective_date = _orig_get_effective
         verify_buy_type.get_effective_date = _orig_get_effective
@@ -186,21 +267,19 @@ def run(date: str, sample: int = 0, workers: int = 4):
     generate_signals(all_codes["周线"], bt_data / "weekly",
                      bt_data / "signals_weekly", "周线", date, workers)
 
-    # ── struct_cache 复制（周日共振预筛需要） ──
-    print("\n[2b+/4] 复制 struct_cache (日线+周线) ...")
-    import shutil as _shutil
-    for _sn, _dn in [("struct_cache", "struct_cache"),
-                      ("struct_cache_weekly", "struct_cache_weekly")]:
-        _src = BASE / "data" / _sn
-        if _src.exists():
-            _shutil.copytree(str(_src), str(bt_data / _dn))
-            print(f"  {_sn} → {bt_data/_dn}")
+    # Rebuild struct_cache (daily + weekly)
+    print("\n[2b+/4] Rebuild struct_cache (daily + weekly) ...")
+    build_struct_cache(all_codes["日线"], bt_data / "daily",
+                       bt_data / "struct_cache", "日线", workers)
+    build_struct_cache(all_codes["周线"], bt_data / "weekly",
+                       bt_data / "struct_cache_weekly", "周线", workers)
 
     # ── ③c 30min CZSC（按 L1 + 周日共振候选按需） ──
     print("\n[2c/4] ③c L1 → 周日共振预筛 → 30min CZSC 按需...")
 
     # 先跑 L1 获取候选代码
-    restore_temp = _patch_paths(bt_data, cutoff)
+    hist_regime = _lookup_regime(date)
+    restore_temp = _patch_paths(bt_data, cutoff, hist_regime)
     l1_codes = set()
     try:
         import zone1_deposition
@@ -229,11 +308,15 @@ def run(date: str, sample: int = 0, workers: int = 4):
     generate_signals(m30_codes, bt_data / "min30",
                      bt_data / "signals_30min", "30分钟", date, workers,
                      max_bars=800)
+    # 30min struct_cache 是结构联立检查的必要输入，之前缺失导致历史截面永远无 [周_日_30m_结构联立]
+    build_struct_cache(m30_codes, bt_data / "min30",
+                       bt_data / "struct_cache_30m", "30分钟", workers)
 
     # ── Step 4: 全管道 L1→L4 ──
     print("\n[3/4] 全管道 L1→L4...")
 
-    restore = _patch_paths(bt_data, cutoff)
+    hist_regime = _lookup_regime(date)
+    restore = _patch_paths(bt_data, cutoff, hist_regime)
     try:
         from manual_backtest.engine import ManualBacktester
         bt = ManualBacktester()

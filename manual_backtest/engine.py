@@ -3,6 +3,8 @@
 复用 zone1_deposition → zone2_regime → zone3_regime → zone4_regime 全漏斗，
 与 l1_update.py / run_zones.py 的数据更新管线完全一致。
 """
+import json
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -12,7 +14,8 @@ from core.data import load_daily, load_signals, get_next_trading_day, get_price_
 from core.signal_detector import detect_all_changes
 from core.structure_cache import load_structure_for_code
 from backtest.exit_engine import ExitEngine
-from manual_backtest.report import export_l4_csv, export_trades_csv
+from manual_backtest.analyzer import ManualAnalyzer
+from manual_backtest.report import export_l4_csv, export_trades_csv, print_summary
 
 from zone1_deposition import run as zone1_run
 from zone2_regime import run as zone2_run
@@ -22,6 +25,22 @@ import regime_detector
 from verify_buy_type import verify_buy_type, check_resonance
 
 _OUT_BASE = Path(__file__).parent.parent / "tmp_out" / "manual_backtest"
+_BASE_DIR = Path(__file__).parent.parent
+_STOCK_NAME_CACHE: dict[str, str] | None = None
+
+
+def _stock_name_map() -> dict[str, str]:
+    """加载本地股票代码->名称映射，避免回测依赖网络请求。"""
+    global _STOCK_NAME_CACHE
+    if _STOCK_NAME_CACHE is None:
+        path = _BASE_DIR / "data" / "industry_classification.parquet"
+        try:
+            df = pd.read_parquet(path)
+            _STOCK_NAME_CACHE = dict(zip(df["code"].astype(str).str.zfill(6),
+                                        df["name"].astype(str)))
+        except Exception:
+            _STOCK_NAME_CACHE = {}
+    return _STOCK_NAME_CACHE
 
 DEFAULT_CONFIG = {}
 
@@ -99,6 +118,7 @@ class ManualBacktester:
         l4 = pd.DataFrame()
         if not df4.empty:
             l4["code"] = df4["code"].astype(str).str.zfill(6)
+            l4["name"] = l4["code"].map(_stock_name_map()).fillna("")
             l4["buy_type"] = df4["买点类型"].astype(str)
             l4["signal_date"] = date
             l4["regime"] = regime
@@ -147,6 +167,8 @@ class ManualBacktester:
             df = pd.concat(dfs, ignore_index=True)
         else:
             df = pd.read_csv(path, encoding="utf-8-sig")
+        if "code" in df.columns:
+            df["code"] = df["code"].astype(str).str.zfill(6)
         self.marked = df[df["selected"] == 1].reset_index(drop=True)
         return self.marked
 
@@ -272,3 +294,79 @@ class ManualBacktester:
         self.marked = self.l4_df.head(top_n).copy()
         self.marked["selected"] = 1
         return self.backtest_selected()
+
+    def backtest_all_l4(self, l4_dir=None, out_dir=None, limit: int = 0,
+                        force: bool = False) -> pd.DataFrame:
+        """对全部已完成 L4 截面做出场回测，所有行视为人工选中。
+
+        与 backtest_selected 共用同一套回测逻辑，仅把 selected 全部置 1。
+        """
+        l4_dir = Path(l4_dir) if l4_dir else _BASE_DIR / "tmp_out"
+        out_dir = Path(out_dir) if out_dir else l4_dir / "exit_backtest"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        progress = out_dir / "progress.txt"
+        l4_files = sorted(l4_dir.glob("backtest_*/l4_*.csv"))
+
+        total_rows = 0
+        total_trades = 0
+        t0 = time.time()
+
+        for fi, f in enumerate(l4_files, 1):
+            df = pd.read_csv(f, encoding="utf-8-sig")
+            if df.empty:
+                continue
+            section_date = str(df["signal_date"].iloc[0])
+            per_section_out = out_dir / f"trades_{section_date}.csv"
+
+            if per_section_out.exists() and not force:
+                n = len(pd.read_csv(per_section_out, encoding="utf-8-sig"))
+                total_trades += n
+                msg = f"[{fi}/{len(l4_files)}] {section_date} SKIP {n} trades {time.time()-t0:.0f}s"
+                progress.write_text(msg + "\n")
+                print(msg, flush=True)
+                continue
+
+            if limit and total_rows >= limit:
+                break
+            take = df
+            if limit:
+                take = df.head(limit - total_rows)
+
+            take = take.copy()
+            take["selected"] = 1
+            if "code" in take.columns:
+                take["code"] = take["code"].astype(str).str.zfill(6)
+            self.marked = take.reset_index(drop=True)
+            self._current_date = section_date
+            trades = self.backtest_selected()
+
+            total_rows += len(take)
+            total_trades += len(trades)
+            if not trades.empty:
+                trades = trades.copy()
+                trades["section_date"] = section_date
+                export_trades_csv(trades, per_section_out)
+
+            msg = (f"[{fi}/{len(l4_files)}] {section_date} rows={len(take)} "
+                   f"trades={len(trades)} skip={len(take)-len(trades)} "
+                   f"{time.time()-t0:.0f}s")
+            progress.write_text(msg + "\n")
+            print(msg, flush=True)
+
+        combined = []
+        for pf in sorted(out_dir.glob("trades_*.csv")):
+            combined.append(pd.read_csv(pf, encoding="utf-8-sig"))
+        all_trades = pd.concat(combined, ignore_index=True) if combined else pd.DataFrame()
+
+        trades_path = out_dir / "trades_all.csv"
+        export_trades_csv(all_trades, trades_path)
+        if all_trades.empty:
+            print("NO TRADES", flush=True)
+            return all_trades
+
+        stats = ManualAnalyzer(all_trades).analyze()
+        with open(out_dir / "stats_all.json", "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2, default=str)
+        print(f"\n合并交易: {len(all_trades)} 笔 -> {trades_path}", flush=True)
+        print_summary(stats)
+        return all_trades
