@@ -195,7 +195,7 @@ class ManualBacktester:
                 sell_events = [c for c in changes if c["type"] == "sell"]
                 target_d = pd.Timestamp(signal_date).date()
                 matched = None
-                bt_keyword = {"一买": "一买", "二买": "二买", "三买": "三买"}.get(buy_type, "一买")
+                bt_keyword = next((k for k in ("一买", "二买", "三买") if k in buy_type), "一买")
                 for be in reversed(buy_events):
                     be_d = pd.Timestamp(be["date"]).date()
                     if be_d <= target_d and bt_keyword in be.get("signal_label", ""):
@@ -210,7 +210,7 @@ class ManualBacktester:
                 if matched is None:
                     continue
                 daily_sorted = daily.sort_values("date").reset_index(drop=True)
-                entry_date = get_next_trading_day(matched["date"], daily_sorted)
+                entry_date = get_next_trading_day(signal_date, daily_sorted)
                 if entry_date is None:
                     continue
                 entry_price = get_price_at_date(entry_date, daily_sorted)

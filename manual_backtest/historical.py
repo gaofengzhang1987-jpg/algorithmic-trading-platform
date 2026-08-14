@@ -266,31 +266,8 @@ def _patch_paths(bt_data: Path, cutoff: pd.Timestamp, historical_regime: str = N
             setattr(mod, attr, val)
     return restore
 
-
-def _patch_exit_data_paths(bt_data: Path):
-    """把出场回测数据源指向截面目录，避免使用当前全量信号/结构造成未来数据污染。"""
-    import backtest.exit_engine
-    import core.data
-    import core.structure_cache
-
-    _orig = {}
-    for mod, attr, val in [
-        (core.data, "DATA_DIR", bt_data / "daily"),
-        (core.data, "SIGNALS_DIR", bt_data / "signals"),
-        (core.structure_cache, "STRUCT_DIR", bt_data / "struct_cache"),
-        (backtest.exit_engine, "STRUCT_30M_DIR", bt_data / "struct_cache_30m"),
-    ]:
-        _orig[(mod, attr)] = getattr(mod, attr)
-        setattr(mod, attr, val)
-
-    def restore():
-        for (mod, attr), val in _orig.items():
-            setattr(mod, attr, val)
-    return restore
-
-
 def run_exit_backtest_for_section(bt_dir: Path, date: str) -> int:
-    """截面内立即出场回测：使用本截面构建的 daily/signals/struct，跑完全部 L4 候选。"""
+    """截面内立即出场回测：选股用截面数据，出场用全量后续数据，截面日次日开盘入场。"""
     l4_path = bt_dir / f"l4_{date}.csv"
     if not l4_path.exists():
         return 0
@@ -304,14 +281,10 @@ def run_exit_backtest_for_section(bt_dir: Path, date: str) -> int:
     from manual_backtest.engine import ManualBacktester
     from manual_backtest.report import export_trades_csv
 
-    restore = _patch_exit_data_paths(bt_dir / "data")
-    try:
-        bt = ManualBacktester()
-        bt.marked = df.reset_index(drop=True)
-        bt._current_date = date
-        trades = bt.backtest_selected()
-    finally:
-        restore()
+    bt = ManualBacktester()
+    bt.marked = df.reset_index(drop=True)
+    bt._current_date = date
+    trades = bt.backtest_selected()
 
     if trades.empty:
         return 0
@@ -441,9 +414,8 @@ def run(date: str, sample: int = 0, workers: int = 4):
 
 
 def run_exit_backtest(date: str) -> pd.DataFrame:
-    """用截面重建的数据跑全量 L4 出场回测（必须在清理 data/ 前调用）。"""
+    """用当前全量数据跑全量 L4 出场回测，入场价为截面日下一交易日开盘价。"""
     bt_dir = TMP / f"backtest_{date}"
-    bt_data = bt_dir / "data"
     l4_path = bt_dir / f"l4_{date}.csv"
     if not l4_path.exists():
         return pd.DataFrame()
@@ -455,14 +427,10 @@ def run_exit_backtest(date: str) -> pd.DataFrame:
         df["code"] = df["code"].astype(str).str.zfill(6)
 
     from manual_backtest.engine import ManualBacktester
-    restore = _patch_paths(bt_data, pd.Timestamp(date))
-    try:
-        bt = ManualBacktester()
-        bt.marked = df.reset_index(drop=True)
-        bt._current_date = date
-        trades = bt.backtest_selected()
-    finally:
-        restore()
+    bt = ManualBacktester()
+    bt.marked = df.reset_index(drop=True)
+    bt._current_date = date
+    trades = bt.backtest_selected()
 
     if trades.empty:
         return trades

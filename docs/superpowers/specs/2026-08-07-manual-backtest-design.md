@@ -84,12 +84,17 @@ class ManualBacktester:
 `signal_date` 传入 `SignalQlibPredictor.score()`，且 `signal_predictor`
 的 `DATA_DIR` / `SIGNAL_DIR` 指向截面目录（2026-08-14 修正）。
 
+**出场口径（2026-08-14 调整）**：选股仍截止到截面日；出场回测读取
+全量后续 daily/signals/struct，入场价为截面日下一交易日开盘价，随后
+逐 bar 扫描到卖点/止损/到期。截面日处于买点状态的候选不再因“无下一
+交易日”被跳过。
+
 ### 3.2 backtest_selected 流程
 
 ```
 对每只标记股票：
-  1. 从信号文件中反查 ≤signal_date 且 buy_type 匹配的最近 buy 事件
-  2. 以该事件的 next_trading_day 为 entry_date，开盘价为 entry_price
+  1. 从信号文件中反查 ≤signal_date 且 buy_type 匹配的最近 buy 事件（确认买点类型/初始止损）
+  2. 以 signal_date 的 next_trading_day 为 entry_date，开盘价为 entry_price（全量后续数据）
   3. 构造 ExitEngine(code, entry_price, entry_date, buy_type, struct_df, trajectory_log=True)
   4. 逐 bar process_bar，记录出场轨迹
   5. 收集 exit_reason / exit_price / exit_date / return_pct / hold_days / trajectory_json

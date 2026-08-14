@@ -200,3 +200,33 @@ def test_zone4_passes_signal_date_to_ranker(tmp_path, monkeypatch):
     })
     zone4_regime.run(input_df, top_n=100, skip_fundamental=True, signal_date="2021-03-01")
     assert fake.rank.call_args.kwargs["signal_date"] == "2021-03-01"
+
+
+def test_backtest_selected_matches_correct_buy_type(monkeypatch):
+    import backtest.exit_engine as ee
+    import manual_backtest.engine as eng
+
+    dates = pd.date_range("2021-01-04", "2021-03-10", freq="B")
+    daily = pd.DataFrame({
+        "date": dates, "open": 10.0, "high": 11.0, "low": 9.0,
+        "close": 10.5, "volume": 1000.0,
+    })
+    buy_events = [
+        {"date": "2021-02-20", "type": "buy", "signal_label": "一买(BUY1)"},
+        {"date": "2021-02-25", "type": "buy", "signal_label": "二买(BS2辅助V23)"},
+    ]
+    monkeypatch.setattr(eng, "load_daily", lambda code: daily)
+    monkeypatch.setattr(eng, "load_signals", lambda code: pd.DataFrame({"dt": dates}))
+    monkeypatch.setattr(eng, "detect_all_changes", lambda sig: list(buy_events))
+    monkeypatch.setattr(eng, "load_structure_for_code", lambda code: None)
+    monkeypatch.setattr(ee, "_load_struct_30m", lambda code: None)
+
+    bt = eng.ManualBacktester()
+    bt.marked = pd.DataFrame([{
+        "code": "000001", "buy_type": "二买_标准", "signal_date": "2021-03-01",
+        "global_rank": 1, "composite": 0.9, "regime": "CHOP",
+    }])
+    bt._current_date = "2021-03-01"
+    trades = bt.backtest_selected()
+    assert len(trades) == 1
+    assert trades.iloc[0]["entry_date"] == "2021-03-02"
