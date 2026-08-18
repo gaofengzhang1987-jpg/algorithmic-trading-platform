@@ -51,6 +51,34 @@ def test_update_defense_uses_finished_pivot():
     assert eng.defense == pytest.approx(15.0)
 
 
+def test_init_stop_floor_applies_to_buy1():
+    struct = _struct_df([{
+        "direction": "向下", "high": 9.8, "low": 1.0,
+        "sdt": "2023-12-20", "edt": "2024-01-05", "power": 1.0,
+        "fx_b_mark": "底分型", "fx_b_low": 1.0, "fx_a_mark": "",
+        "pivot_dir": "", "pivot_gg": 0.0, "pivot_zd": 0.0, "pivot_zg": 0.0,
+    }])
+    eng = ExitEngine("000001", 10.0, "2024-01-10", "一买_标准", struct)
+    assert eng.defense == pytest.approx(9.0)
+
+
+def test_init_stop_floor_applies_to_buy3():
+    struct = _struct_df([_pivot(edt="2024-01-05", gg=1.0, sdt="2023-12-20")])
+    eng = ExitEngine("000001", 10.0, "2024-01-10", "三买_标准", struct)
+    assert eng.defense == pytest.approx(9.0)
+
+
+def test_init_stop_keeps_higher_structural_level():
+    struct = _struct_df([{
+        "direction": "向下", "high": 9.9, "low": 9.7,
+        "sdt": "2023-12-20", "edt": "2024-01-05", "power": 1.0,
+        "fx_b_mark": "底分型", "fx_b_low": 9.7, "fx_a_mark": "",
+        "pivot_dir": "", "pivot_gg": 0.0, "pivot_zd": 0.0, "pivot_zg": 0.0,
+    }])
+    eng = ExitEngine("000001", 10.0, "2024-01-10", "一买_标准", struct)
+    assert eng.defense == pytest.approx(9.7 * 0.96)
+
+
 def test_patch_paths_points_rps_to_section(tmp_path):
     import l3_filter
     from qlib_ml import signal_predictor

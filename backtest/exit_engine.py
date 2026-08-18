@@ -112,22 +112,24 @@ class ExitEngine:
                 low_val = self.entry_bi_low_2buy
             if low_val <= 0:
                 low_val = self.entry_price * DISCOUNT_BUY2
-            return low_val * DISCOUNT_BUY1
+            base = low_val * DISCOUNT_BUY1
         elif "二买" in str(self.buy_type):
             v1 = self.entry_bi_low_1buy if self.entry_bi_low_1buy > 0 else 0
             v2 = self.entry_bi_low_2buy if self.entry_bi_low_2buy > 0 else v1
             base = max(v1, v2)
             if base <= 0:
                 base = self.entry_price * DISCOUNT_BUY2
-            return base * DISCOUNT_BUY2
+            base = base * DISCOUNT_BUY2
         elif "三买" in str(self.buy_type):
             gg = self.entry_pivot_gg if self.entry_pivot_gg > 0 else 0
             v3 = self.entry_bi_low_3buy if self.entry_bi_low_3buy > 0 else 0
             base = max(gg, v3)
             if base <= 0:
                 base = self.entry_price * DISCOUNT_BUY3
-            return base * DISCOUNT_BUY3
-        return self.entry_price * DISCOUNT_BUY2
+            base = base * DISCOUNT_BUY3
+        else:
+            base = self.entry_price * DISCOUNT_BUY2
+        return max(base, self.entry_price * (1 + STOP_LOSS_PCT))
 
     def process_bar(self, bar_date, bar_close, bar_high, sell_exit_target=None):
         """Process one bar through exit priority chain (B1: state machine in engine).
