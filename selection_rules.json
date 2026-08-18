@@ -1,0 +1,9 @@
+{
+  "k": 3,
+  "exclude_rank_top": 20,
+  "score": "rank_pct(l4_rank) - rank_pct(stock_rps) - rank_pct(qlib_score)",
+  "prefer_zone_21_50": true,
+  "prefer_buy_types": ["三买"],
+  "weight": "equal",
+  "note": "2026-08-18 选股 SOP v0.1：排除 top20，重构分数排序，中段 21-50 优先，三买 tie-break；待统一止损口径重跑后复核"
+}

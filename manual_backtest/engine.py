@@ -161,7 +161,14 @@ class ManualBacktester:
         d = Path(out_dir) if out_dir else _OUT_BASE / self._current_date
         d.mkdir(parents=True, exist_ok=True)
         out_path = d / f"l4_{self._current_date}.csv"
-        return export_l4_csv(self.l4_df, out_path)
+        try:
+            from selection_engine import load_rules, select
+            rec = select(self.l4_df, load_rules())
+            rec.to_csv(d / f"recommend_{self._current_date}.csv",
+                       index=False, encoding="utf-8-sig")
+        except Exception:
+            rec = None
+        return export_l4_csv(self.l4_df, out_path, recommendations=rec)
 
     def load_marked(self, path: str | Path) -> pd.DataFrame:
         """读取已标记 CSV (selected=1 的行)."""

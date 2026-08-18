@@ -10,6 +10,7 @@ L4_COLUMNS = [
     "signal_date", "composite", "n_l2", "stock_rps", "sector_rps",
     "qlib_score", "regime", "sector", "total_score", "passed",
     "非买点转买点", "当天非买转买",
+    "sop_recommend", "sop_reason", "sop_score",
 ]
 
 TRADE_COLUMNS = [
@@ -20,13 +21,25 @@ TRADE_COLUMNS = [
 ]
 
 
-def export_l4_csv(l4_df: pd.DataFrame, out_path: Path) -> Path:
-    """导出 L4 报告 CSV，selected 默认为 0."""
+def export_l4_csv(l4_df: pd.DataFrame, out_path: Path, recommendations=None) -> Path:
+    """导出 L4 报告 CSV，selected 默认为 0；可选合并 SOP 推荐列。"""
     df = l4_df.copy()
     if "selected" not in df.columns:
         df["selected"] = 0
     if "code" in df.columns:
         df["code"] = df["code"].astype(str).str.zfill(6)
+    if recommendations is not None and not recommendations.empty and "code" in df.columns:
+        rec = recommendations.copy()
+        rec["code"] = rec["code"].astype(str).str.zfill(6)
+        if "sop_recommend" not in rec.columns:
+            rec["sop_recommend"] = range(1, len(rec) + 1)
+        rec = rec.rename(columns={
+            "sop_recommend": "sop_recommend",
+            "reason": "sop_reason",
+            "score": "sop_score",
+        })
+        df = df.merge(rec[["code", "sop_recommend", "sop_reason", "sop_score"]],
+                      on="code", how="left")
     for col in L4_COLUMNS:
         if col not in df.columns:
             df[col] = ""
